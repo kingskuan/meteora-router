@@ -1526,7 +1526,7 @@ async function start() {
     `候选池: ${state.candidatePools.length}\n\n` +
     `下一步:\n` +
     `1. /scan 看候选池打分\n` +
-    `2. /addpool <地址> 加更多池子\n` +
+    `2. /addpool &lt;地址&gt; 加更多池子\n` +
     `3. DRY_RUN=true 时可以放心 /auto on 测试\n` +
     `4. 验证逻辑没问题后 Railway 改 DRY_RUN=false 上实盘\n\n` +
     `/help 查看所有命令`
