@@ -330,18 +330,52 @@ async function notify(msg: string) {
 
 const priceCache = new Map<string, { price: number; ts: number }>();
 
+// SOL/USDC 价格参考池(用于读链上 SOL 价格)
+const SOL_PRICE_REFERENCE_POOL = 'BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y';
+
+let solPriceCache = { price: 0, ts: 0 };
+
+/**
+ * 从链上 DLMM 池子读 SOL 价格
+ * 完全不依赖 HTTP API,只走 Solana RPC,稳定可靠
+ */
+async function getSolPriceOnchain(): Promise<number> {
+  if (Date.now() - solPriceCache.ts < 30_000 && solPriceCache.price > 0) {
+    return solPriceCache.price;
+  }
+  try {
+    const dlmm = await DLMM.create(connection, new PublicKey(SOL_PRICE_REFERENCE_POOL));
+    const activeBin = await dlmm.getActiveBin();
+    const price = parseFloat(dlmm.fromPricePerLamport(Number(activeBin.price)));
+    if (price > 0 && price < 10000) { // sanity check
+      solPriceCache = { price, ts: Date.now() };
+      return price;
+    }
+  } catch (e: any) {
+    console.error(`getSolPriceOnchain failed: ${e.message}`);
+  }
+  return 0;
+}
+
 async function getTokenPriceUsd(mint: string): Promise<number> {
   if (mint === USDC_MINT || mint === USDT_MINT) return 1;
+
+  // SOL: 优先链上 DLMM 读
+  if (mint === SOL_MINT) {
+    const onchain = await getSolPriceOnchain();
+    if (onchain > 0) return onchain;
+    // 实在不行才走 HTTP
+  }
+
   const cached = priceCache.get(mint);
   if (cached && Date.now() - cached.ts < 30_000) return cached.price;
-  // Jupiter price API
+  // Jupiter price API (备用,Railway 上可能 403)
   try {
     const r = await fetch(`${CONFIG.JUP_API}/quote?inputMint=${mint}&outputMint=${USDC_MINT}&amount=${10 ** 9}&slippageBps=50`, {
       signal: AbortSignal.timeout(3000),
     });
     if (r.ok) {
       const d: any = await r.json();
-      // SOL: input 1e9 lamports = 1 SOL; output is in USDC 1e6 base units
       const price = parseFloat(d.outAmount) / 1e6;
       if (price > 0 && !isNaN(price)) {
         priceCache.set(mint, { price, ts: Date.now() });
@@ -353,7 +387,7 @@ async function getTokenPriceUsd(mint: string): Promise<number> {
   }
   // fallback
   if (mint === SOL_MINT) {
-    console.log('⚠️ SOL price fallback to $80');
+    console.log('⚠️ SOL price fallback to $80 (both on-chain and Jupiter failed)');
     return 80;
   }
   return 0;
