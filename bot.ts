@@ -856,11 +856,22 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
   const binStep = dlmmPool.lbPair.binStep;
   const activePrice = parseFloat(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
 
-  // 计算 range:用 RANGE_PCT 总幅度,各往两边
-  // bin_step 是 bps,RANGE_PCT 是百分比;每边的 bins 数 ≈ RANGE_PCT * 100 / bin_step
-  const halfRangeBins = Math.max(3, Math.ceil((CONFIG.RANGE_PCT * 100) / binStep / 2));
+  // 计算 range:RANGE_PCT 是总区间宽度(±RANGE_PCT/2 各往两边)
+  // bin_step bps × bins_per_side ≈ pct_per_side × 100
+  // halfBins = (RANGE_PCT / 2) × 100 / bin_step
+  //
+  // 对 SDK V1 的 position bin 上限做硬性限制(≤ 60 bins/side = 120 bins total)
+  // 避免超过 70 bins/position 拒绝
+  const halfPctTarget = CONFIG.RANGE_PCT / 2;
+  let halfRangeBins = Math.max(3, Math.ceil((halfPctTarget * 100) / binStep));
+  if (halfRangeBins > 60) halfRangeBins = 60; // SDK V1 限制兜底
   const minBinId = activeBin.binId - halfRangeBins;
   const maxBinId = activeBin.binId + halfRangeBins;
+
+  // 实际 range 百分比(用于日志 + 通知)
+  const totalBins = (maxBinId - minBinId + 1);
+  const actualRangePct = (Math.pow(1 + binStep / 10000, totalBins) - 1) * 100;
+  console.log(`[openPosition] bin_step=${binStep}, target=±${halfPctTarget}%, halfBins=${halfRangeBins}, total=${totalBins} bins, actualRange=${actualRangePct.toFixed(2)}%`);
 
   // 目标 50/50:amountUsd / 2 在 X,amountUsd / 2 在 Y
   const xPrice = await getTokenPriceUsd(tokenXMint);
