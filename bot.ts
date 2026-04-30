@@ -1,6 +1,6 @@
 /**
  * Meteora Router - DLMM Auto Rebalance Bot
- * V0.1 - Step 2 (fixed): SDK-first reads + API fallback
+ * V0.1 - Step 2c: fee 公式修复 + 24h 数据 fallback + bot 冲突保护
  */
 
 import 'dotenv/config';
@@ -11,7 +11,7 @@ import bs58 from 'bs58';
 import express from 'express';
 import DLMM from '@meteora-ag/dlmm';
 
-// ============ 配置层 ============
+// ============ 配置 ============
 const CONFIG = {
   RPC_URL: process.env.HELIUS_RPC_URL || 'https://api.mainnet-beta.solana.com',
   WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
@@ -19,23 +19,21 @@ const CONFIG = {
   TG_OWNER_ID: parseInt(process.env.TG_OWNER_ID || '0'),
   DATABASE_URL: process.env.DATABASE_URL || '',
 
-  // 真实 SOL/USDC DLMM 池(从 meteora.ag 验证得到)
   POOL_SOL_USDC: 'BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y',
   RANGE_PCT: 10,
   REBALANCE_THRESHOLD: 0.45,
   CLAIM_THRESHOLD_PCT: 1.0,
   CHECK_INTERVAL_MS: 30_000,
 
-  // Meteora API hosts(优先用新的,失败 fallback 到旧的;再失败就跳过)
   METEORA_API_HOSTS: [
     'https://dlmm.datapi.meteora.ag',
     'https://dlmm-api.meteora.ag',
   ],
+  GECKOTERMINAL_API: 'https://api.geckoterminal.com/api/v2',
 
   PORT: parseInt(process.env.PORT || '3000'),
 };
 
-// 常用 token mint
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
 const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
 
@@ -134,7 +132,7 @@ async function logEvent(type: string, payload: any = {}) {
   }
 }
 
-// ============ 通知层 ============
+// ============ 通知 ============
 async function notify(msg: string) {
   console.log(`[NOTIFY] ${msg.replace(/<[^>]+>/g, '').slice(0, 200)}`);
   if (CONFIG.TG_OWNER_ID) {
@@ -146,7 +144,7 @@ async function notify(msg: string) {
   }
 }
 
-// ============ Token symbol 简表(避免每次去链上查 metadata) ============
+// ============ Token symbol ============
 const KNOWN_TOKENS: Record<string, { symbol: string; decimals: number }> = {
   [SOL_MINT]:  { symbol: 'SOL', decimals: 9 },
   [USDC_MINT]: { symbol: 'USDC', decimals: 6 },
@@ -154,13 +152,11 @@ const KNOWN_TOKENS: Record<string, { symbol: string; decimals: number }> = {
   'JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN':  { symbol: 'JUP', decimals: 6 },
   'jtojtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL':  { symbol: 'JTO', decimals: 9 },
 };
-
 function tokenSymbol(mint: string): string {
   return KNOWN_TOKENS[mint]?.symbol || `${mint.slice(0, 4)}...`;
 }
 
 // ============ DLMM 读取层 ============
-
 interface PoolInfo {
   address: string;
   pairName: string;
@@ -171,14 +167,14 @@ interface PoolInfo {
   binStep: number;
   baseFeePct: number;
   activeBinId: number;
-  activePrice: number;     // tokenY per tokenX,UI 价格
-  reserveX: number;        // 链上 X 储备(已除 decimals)
-  reserveY: number;        // 链上 Y 储备(已除 decimals)
-  // 以下来自 datapi(可能为空)
+  activePrice: number;
+  reserveX: number;
+  reserveY: number;
   tvlUsd?: number;
   volume24hUsd?: number;
   fees24hUsd?: number;
   feeApr?: number;
+  dataSource?: string;
 }
 
 interface PositionInfo {
@@ -199,8 +195,22 @@ interface PositionInfo {
 }
 
 /**
- * 从 SDK 直接读池子基本信息(不依赖 datapi)
+ * 计算 base fee 百分比
+ *
+ * Meteora 公式 (来自官方文档 DLMM Fee Calculation):
+ *   base_factor 是配置在 lbPair.parameters 里的整数(例如 10000)
+ *   FEE_PRECISION = 1e9 (合约里的常量)
+ *   base_fee_rate = base_factor * bin_step (单位:1e-9 ratio)
+ *   即 fee_pct = base_factor * bin_step / 1e9 * 100  =  base_factor * bin_step / 1e7
+ *
+ * 例:base_factor=10000, bin_step=10  →  10000*10/1e7 = 0.01%
+ *     base_factor=20000, bin_step=20  →  20000*20/1e7 = 0.04%
+ *     base_factor=10000, bin_step=100 →  10000*100/1e7 = 0.1%
  */
+function calcBaseFeePct(baseFactor: number, binStep: number): number {
+  return (baseFactor * binStep) / 1e7;
+}
+
 async function getPoolInfo(lbPair: string): Promise<PoolInfo> {
   const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
   const activeBin = await dlmmPool.getActiveBin();
@@ -215,7 +225,6 @@ async function getPoolInfo(lbPair: string): Promise<PoolInfo> {
     dlmmPool.fromPricePerLamport(Number(activeBin.price))
   );
 
-  // 链上储备(用 SDK 暴露的 reserve 字段;不同 SDK 版本字段位置可能略不同,做容错)
   let reserveX = 0;
   let reserveY = 0;
   try {
@@ -227,10 +236,9 @@ async function getPoolInfo(lbPair: string): Promise<PoolInfo> {
     if (ryRaw !== undefined) reserveY = Number(ryRaw) / Math.pow(10, yDec);
   } catch {}
 
-  // base fee 从 lbPair 配置算出
-  // base_fee_rate = base_factor * bin_step * 10 (basis points / 10000 = pct)
+  // 修复后的 base fee 公式
   const baseFactor = Number(dlmmPool.lbPair.parameters.baseFactor);
-  const baseFeePct = (baseFactor * binStep) / 1_000_000 * 100; // ratio → pct
+  const baseFeePct = calcBaseFeePct(baseFactor, binStep);
 
   const info: PoolInfo = {
     address: lbPair,
@@ -247,30 +255,50 @@ async function getPoolInfo(lbPair: string): Promise<PoolInfo> {
     reserveY,
   };
 
-  // 选填:从 datapi 拿 24h 数据(失败就跳过,不阻塞主流程)
+  // 1) 优先 datapi
   for (const host of CONFIG.METEORA_API_HOSTS) {
     try {
-      const r = await fetch(`${host}/pair/${lbPair}`, {
-        signal: AbortSignal.timeout(3000),
-      });
+      const r = await fetch(`${host}/pair/${lbPair}`, { signal: AbortSignal.timeout(3000) });
       if (!r.ok) continue;
       const d: any = await r.json();
       info.tvlUsd = parseFloat(d.liquidity || '0') || undefined;
       info.volume24hUsd = parseFloat(d.trade_volume_24h || '0') || undefined;
       info.fees24hUsd = parseFloat(d.fees_24h || '0') || undefined;
       info.feeApr = parseFloat(d.apr || '0') || undefined;
+      info.dataSource = 'meteora';
       break;
-    } catch {
-      // try next host
-    }
+    } catch {}
+  }
+
+  // 2) datapi 拿不到 → fallback GeckoTerminal
+  if (!info.tvlUsd) {
+    try {
+      const r = await fetch(
+        `${CONFIG.GECKOTERMINAL_API}/networks/solana/pools/${lbPair}`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      if (r.ok) {
+        const d: any = await r.json();
+        const a = d?.data?.attributes;
+        if (a) {
+          info.tvlUsd = parseFloat(a.reserve_in_usd || '0') || undefined;
+          info.volume24hUsd = parseFloat(a.volume_usd?.h24 || '0') || undefined;
+          // GeckoTerminal 没有 fees,按 base_fee × volume 估算
+          if (info.volume24hUsd) {
+            info.fees24hUsd = info.volume24hUsd * (baseFeePct / 100);
+            if (info.tvlUsd && info.tvlUsd > 0) {
+              info.feeApr = (info.fees24hUsd * 365 / info.tvlUsd) * 100;
+            }
+          }
+          info.dataSource = 'geckoterminal';
+        }
+      }
+    } catch {}
   }
 
   return info;
 }
 
-/**
- * 读取钱包在某个池子里的所有仓位(SDK 链上读)
- */
 async function getUserPositions(lbPair?: string): Promise<PositionInfo[]> {
   const results: PositionInfo[] = [];
 
@@ -294,9 +322,7 @@ async function getUserPositions(lbPair?: string): Promise<PositionInfo[]> {
 
   const activeBin = await dlmmPool.getActiveBin();
   const binStep = dlmmPool.lbPair.binStep;
-  const activePrice = parseFloat(
-    dlmmPool.fromPricePerLamport(Number(activeBin.price))
-  );
+  const activePrice = parseFloat(dlmmPool.fromPricePerLamport(Number(activeBin.price)));
 
   const xSym = tokenSymbol(dlmmPool.tokenX.publicKey.toBase58());
   const ySym = tokenSymbol(dlmmPool.tokenY.publicKey.toBase58());
@@ -345,7 +371,6 @@ bot.command('ping', async (ctx) => {
 bot.command('status', async (ctx) => {
   await ctx.reply('⏳ 查询中...');
   try {
-    // 钱包 SOL 余额
     let solBalance = 'N/A';
     let rpcStatus = '❌';
     try {
@@ -353,16 +378,14 @@ bot.command('status', async (ctx) => {
       solBalance = (balance / 1e9).toFixed(4);
       rpcStatus = CONFIG.RPC_URL.includes('helius') ? 'Helius ✅' : 'Default ⚠️';
     } catch (e: any) {
-      rpcStatus = `❌ RPC 错: ${e.message.slice(0, 80)}`;
+      rpcStatus = `❌ ${e.message.slice(0, 80)}`;
     }
 
-    // DB
     const dbR = await db.query('SELECT COUNT(*) as c FROM events');
     const eventCount = parseInt(dbR.rows[0].c);
     const posR = await db.query(`SELECT COUNT(*) as c FROM positions WHERE status='open'`);
     const openCount = parseInt(posR.rows[0].c);
 
-    // 链上仓位(失败不阻塞)
     let posSection = '';
     try {
       const positions = await getUserPositions();
@@ -389,7 +412,7 @@ bot.command('status', async (ctx) => {
       `RPC: ${rpcStatus}\n` +
       `DB: ✅ events=${eventCount}, open=${openCount}\n` +
       posSection +
-      `\n<i>V0.1 Step 2 (fixed)</i>`,
+      `\n<i>V0.1 Step 2c</i>`,
       { parse_mode: 'HTML' }
     );
   } catch (e: any) {
@@ -397,10 +420,6 @@ bot.command('status', async (ctx) => {
   }
 });
 
-/**
- * /pool [addr]  查询池子实时指标
- * 默认 SOL/USDC,可传任意 DLMM lb_pair 地址
- */
 bot.command('pool', async (ctx) => {
   const args = ctx.message.text.split(/\s+/).slice(1);
   const addr = args[0] || CONFIG.POOL_SOL_USDC;
@@ -416,16 +435,18 @@ bot.command('pool', async (ctx) => {
       return `${label}: $${val.toLocaleString(undefined, { maximumFractionDigits: 0 })}\n`;
     };
 
+    const sourceTag = info.dataSource ? ` (${info.dataSource})` : '';
+
     await ctx.reply(
       `<b>🌊 ${info.pairName}</b>\n\n` +
       `地址: <code>${info.address}</code>\n` +
       `Bin Step: ${info.binStep} bps\n` +
-      `Base Fee: ${info.baseFeePct.toFixed(3)}%\n` +
+      `Base Fee: ${info.baseFeePct.toFixed(4)}%\n` +
       `Active bin: ${info.activeBinId}\n` +
       `当前价: ${info.activePrice.toFixed(6)} ${info.tokenYSymbol}/${info.tokenXSymbol}\n` +
       `Reserve X: ${info.reserveX.toFixed(2)} ${info.tokenXSymbol}\n` +
       `Reserve Y: ${info.reserveY.toFixed(2)} ${info.tokenYSymbol}\n` +
-      `\n<b>24h 数据 (datapi)</b>\n` +
+      `\n<b>24h 数据${sourceTag}</b>\n` +
       optional('TVL', info.tvlUsd) +
       optional('Volume', info.volume24hUsd) +
       optional('Fees', info.fees24hUsd) +
@@ -476,7 +497,7 @@ bot.command('help', async (ctx) => {
     `/pool [addr] - 池子实时指标 (默认 SOL/USDC)\n` +
     `/positions - 链上仓位详情\n` +
     `/help - 帮助\n` +
-    `\n<i>V0.1 Step 2 - 读取层完成</i>`,
+    `\n<i>V0.1 Step 2c</i>`,
     { parse_mode: 'HTML' }
   );
 });
@@ -522,13 +543,24 @@ async function start() {
   await initDb();
   await logEvent('boot', { wallet: wallet.publicKey.toBase58() });
 
-  bot.launch();
+  // 给上一个进程留 5 秒时间退出,避免 TG getUpdates 冲突
+  console.log('⏳ Sleeping 5s before launching TG bot (prevent conflict)...');
+  await new Promise(r => setTimeout(r, 5000));
+
+  // dropPendingUpdates: true 让 telegram 丢掉之前积压的请求(消除冲突惯性)
+  // allowedUpdates 只订阅 message 减少干扰
+  bot.launch({
+    dropPendingUpdates: true,
+    allowedUpdates: ['message'],
+  }).catch((e: any) => {
+    console.error('TG launch error:', e?.message);
+  });
   console.log('🤖 TG bot launched');
 
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.1 Step 2 (fixed)\n` +
+    `Version: V0.1 Step 2c\n` +
     `\n发送 /help 查看命令`
   );
 
