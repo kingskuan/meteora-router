@@ -26,6 +26,7 @@ import {
   ComputeBudgetProgram,
   sendAndConfirmTransaction,
 } from '@solana/web3.js';
+import { getAssociatedTokenAddress, getAccount } from '@solana/spl-token';
 import { Telegraf, Markup } from 'telegraf';
 import { Pool } from 'pg';
 import bs58 from 'bs58';
@@ -342,13 +343,64 @@ async function getTokenPriceUsd(mint: string): Promise<number> {
       const d: any = await r.json();
       // SOL: input 1e9 lamports = 1 SOL; output is in USDC 1e6 base units
       const price = parseFloat(d.outAmount) / 1e6;
-      priceCache.set(mint, { price, ts: Date.now() });
-      return price;
+      if (price > 0 && !isNaN(price)) {
+        priceCache.set(mint, { price, ts: Date.now() });
+        return price;
+      }
     }
-  } catch {}
+  } catch (e: any) {
+    console.error(`getTokenPriceUsd Jupiter failed: ${e.message}`);
+  }
   // fallback
-  if (mint === SOL_MINT) return 80; // 极端 fallback,不应该走到
+  if (mint === SOL_MINT) {
+    console.log('⚠️ SOL price fallback to $80');
+    return 80;
+  }
   return 0;
+}
+
+/**
+ * 读取钱包某 SPL token 余额(UI 单位,已除 decimals)
+ */
+async function getSplBalance(mint: string, decimals: number): Promise<number> {
+  try {
+    const ata = await getAssociatedTokenAddress(new PublicKey(mint), wallet.publicKey);
+    const acc = await getAccount(connection, ata);
+    return Number(acc.amount) / Math.pow(10, decimals);
+  } catch {
+    // ATA 不存在 = 余额 0
+    return 0;
+  }
+}
+
+/**
+ * 钱包总 USD 价值快照(SOL + USDC + USDT,扣除 gas 储备)
+ */
+interface WalletSnapshot {
+  solBalance: number;
+  solPrice: number;
+  solUsd: number;
+  usdcBalance: number;
+  usdtBalance: number;
+  gasReserveSol: number;
+  totalUsableUsd: number;
+}
+
+async function getWalletSnapshot(): Promise<WalletSnapshot> {
+  const lamports = await connection.getBalance(wallet.publicKey);
+  const solBalance = lamports / 1e9;
+  const solPrice = await getTokenPriceUsd(SOL_MINT);
+  const usdcBalance = await getSplBalance(USDC_MINT, 6);
+  const usdtBalance = await getSplBalance(USDT_MINT, 6);
+
+  const gasReserveSol = 0.05; // 留 0.05 SOL 给 gas
+  const usableSol = Math.max(0, solBalance - gasReserveSol);
+  const solUsd = usableSol * solPrice;
+  const totalUsableUsd = solUsd + usdcBalance + usdtBalance;
+
+  console.log(`[wallet] SOL=${solBalance.toFixed(4)} (price=$${solPrice.toFixed(2)}) USDC=${usdcBalance.toFixed(2)} USDT=${usdtBalance.toFixed(2)} usable=$${totalUsableUsd.toFixed(2)}`);
+
+  return { solBalance, solPrice, solUsd, usdcBalance, usdtBalance, gasReserveSol, totalUsableUsd };
 }
 
 // ============================================================
@@ -1102,13 +1154,20 @@ async function tickAutoOpen() {
   const dup = await db.query(`SELECT 1 FROM positions WHERE lb_pair=$1 AND status='open' LIMIT 1`, [best.info.address]);
   if (dup.rows.length > 0) return;
 
-  // 计算可投金额(40% of free SOL+USDC,封顶 MAX_POSITION_USD)
-  const solBal = await connection.getBalance(wallet.publicKey);
-  const solUsd = (solBal / 1e9) * await getTokenPriceUsd(SOL_MINT);
-  const investUsd = Math.min(solUsd * 0.4, CONFIG.MAX_POSITION_USD);
+  // 计算可投金额(40% of total usable = SOL+USDC+USDT,封顶 MAX_POSITION_USD)
+  const wallet_ = await getWalletSnapshot();
+  const investUsd = Math.min(wallet_.totalUsableUsd * 0.4, CONFIG.MAX_POSITION_USD);
 
-  if (investUsd < 10) {
-    await notify(`⚠️ 可投金额过小: ${fmtUsd(investUsd)}`);
+  if (investUsd < 5) {
+    await notify(
+      `⚠️ <b>可投金额过小</b>: ${fmtUsd(investUsd)}\n\n` +
+      `钱包详情:\n` +
+      `SOL: ${wallet_.solBalance.toFixed(4)} (~${fmtUsd(wallet_.solUsd)},扣 ${wallet_.gasReserveSol} SOL gas)\n` +
+      `USDC: ${fmtUsd(wallet_.usdcBalance)}\n` +
+      `USDT: ${fmtUsd(wallet_.usdtBalance)}\n` +
+      `总可用: ${fmtUsd(wallet_.totalUsableUsd)}\n` +
+      `40% 投入 = ${fmtUsd(wallet_.totalUsableUsd * 0.4)}`
+    );
     return;
   }
 
@@ -1181,9 +1240,7 @@ bot.command('help', async (ctx) => {
 bot.command('status', async (ctx) => {
   await ctx.reply('⏳');
   try {
-    const balance = await connection.getBalance(wallet.publicKey);
-    const solBal = balance / 1e9;
-    const solPrice = await getTokenPriceUsd(SOL_MINT);
+    const w = await getWalletSnapshot();
 
     const dbR = await db.query('SELECT COUNT(*) as c FROM events');
     const evCount = parseInt(dbR.rows[0].c);
@@ -1213,11 +1270,15 @@ bot.command('status', async (ctx) => {
     await ctx.reply(
       `<b>📊 Status</b>\n\n` +
       `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-      `SOL: ${solBal.toFixed(4)} (~${fmtUsd(solBal * solPrice)})\n` +
-      `仓位价值: ${fmtUsd(totalPosValue)}\n` +
+      `\n<b>💰 余额</b>\n` +
+      `SOL: ${w.solBalance.toFixed(4)} (price $${w.solPrice.toFixed(2)})\n` +
+      `USDC: ${fmtUsd(w.usdcBalance)}\n` +
+      `USDT: ${fmtUsd(w.usdtBalance)}\n` +
+      `可用 (扣 ${w.gasReserveSol} SOL gas): ${fmtUsd(w.totalUsableUsd)}\n` +
+      `仓位值: ${fmtUsd(totalPosValue)}\n` +
       `未领 fee: ${fmtUsd(totalFeeValue)}\n` +
-      `\n<b>⚙️ 运行状态</b>\n` +
-      `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON (模拟)' : '🟢 OFF (实盘)'}\n` +
+      `\n<b>⚙️ 运行</b>\n` +
+      `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘)'}\n` +
       `Auto: ${state.autoTrading ? '🟢 ON' : '⚪ OFF'}\n` +
       `Paused: ${state.paused ? '🔴 YES' : '🟢 NO'}\n` +
       `Open: ${openCount}/${CONFIG.MAX_OPEN_POSITIONS}\n` +
