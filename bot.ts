@@ -783,6 +783,15 @@ async function scanPools(): Promise<ScoredPool[]> {
 // ============================================================
 
 function withPriorityFee(tx: Transaction): Transaction {
+  // 检查 SDK 是否已经加了 ComputeBudget instructions
+  // 如果有,跳过(避免 "duplicate instruction" 错误)
+  const COMPUTE_BUDGET_PROGRAM_ID = 'ComputeBudget111111111111111111111111111111';
+  const hasComputeBudget = tx.instructions.some(
+    ix => ix.programId.toBase58() === COMPUTE_BUDGET_PROGRAM_ID
+  );
+  if (hasComputeBudget) {
+    return tx; // SDK 自己处理了,不重复加
+  }
   tx.instructions.unshift(
     ComputeBudgetProgram.setComputeUnitPrice({ microLamports: CONFIG.PRIORITY_FEE_MICRO_LAMPORTS }),
     ComputeBudgetProgram.setComputeUnitLimit({ units: 600_000 })
@@ -894,11 +903,12 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
   // bin_step bps × bins_per_side ≈ pct_per_side × 100
   // halfBins = (RANGE_PCT / 2) × 100 / bin_step
   //
-  // 对 SDK V1 的 position bin 上限做硬性限制(≤ 60 bins/side = 120 bins total)
-  // 避免超过 70 bins/position 拒绝
+  // 关键限制:DLMM SDK V1 single position 最多 70 bins
+  // (Solana realloc 上限 10240 bytes,每 bin 数据空间限制)
+  // 所以 halfBins 最大 34(总 69 bins,留 1 buffer)
   const halfPctTarget = CONFIG.RANGE_PCT / 2;
   let halfRangeBins = Math.max(3, Math.ceil((halfPctTarget * 100) / binStep));
-  if (halfRangeBins > 60) halfRangeBins = 60; // SDK V1 限制兜底
+  if (halfRangeBins > 34) halfRangeBins = 34; // SDK V1 单 position 70 bins 上限
   const minBinId = activeBin.binId - halfRangeBins;
   const maxBinId = activeBin.binId + halfRangeBins;
 
