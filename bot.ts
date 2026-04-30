@@ -597,15 +597,23 @@ interface ScoredPool {
 function scorePool(p: PoolInfo): { score: number; reasons: string[] } {
   const reasons: string[] = [];
 
-  // 硬筛
+  // 硬筛 1: token 白名单
   if (!WHITELIST_MINTS.has(p.tokenXMint) || !WHITELIST_MINTS.has(p.tokenYMint)) {
     reasons.push('token 不在白名单');
     return { score: -1, reasons };
   }
-  if (p.binStep < 20 || p.binStep > 100) {
-    reasons.push(`bin_step ${p.binStep} 不在 20-100`);
+
+  // 硬筛 2: bin_step 按 pair 类型分级
+  // - stable-stable (USDC/USDT): 1-10 bps (价差极小,大 step 抓不到 fee)
+  // - SOL pair (SOL/USDC, SOL/USDT): 4-100 bps (兼容主流市场池子)
+  const isStableStable = p.tokenXMint !== SOL_MINT && p.tokenYMint !== SOL_MINT;
+  const [minBs, maxBs] = isStableStable ? [1, 10] : [4, 100];
+  if (p.binStep < minBs || p.binStep > maxBs) {
+    reasons.push(`bin_step ${p.binStep} 不在 ${minBs}-${maxBs}(${isStableStable ? 'stable' : 'SOL pair'})`);
     return { score: -1, reasons };
   }
+
+  // 硬筛 3: TVL / Volume
   if (!p.tvlUsd || p.tvlUsd < 500_000) {
     reasons.push(`TVL ${fmtUsd(p.tvlUsd)} < $500k`);
     return { score: -1, reasons };
@@ -614,13 +622,13 @@ function scorePool(p: PoolInfo): { score: number; reasons: string[] } {
     reasons.push(`Vol ${fmtUsd(p.volume24hUsd)} < $200k`);
     return { score: -1, reasons };
   }
+
+  // 硬筛 4: APR
   if (!p.feeApr) {
     reasons.push('无 APR 数据');
     return { score: -1, reasons };
   }
-  // stable-stable 池(USDC/USDT)阈值放宽到 5%
-  const isStableStable = p.tokenXMint !== SOL_MINT && p.tokenYMint !== SOL_MINT;
-  const minApr = isStableStable ? 5 : 20;
+  const minApr = isStableStable ? 3 : 15;
   if (p.feeApr < minApr) {
     reasons.push(`APR ${fmtPct(p.feeApr)} < ${minApr}%`);
     return { score: -1, reasons };
