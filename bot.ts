@@ -90,12 +90,12 @@ const KNOWN_TOKENS: Record<string, { symbol: string; decimals: number }> = {
 // 白名单 token mint(只允许这些 token 进入候选池)
 const WHITELIST_MINTS = new Set([SOL_MINT, USDC_MINT, USDT_MINT]);
 
-// 候选池子(V0.1 硬编码主流池;未来可入库)
+// 候选池子(V0.1 硬编码主流池;/discover 命令会自动扩充)
 // 这些是 SOL/USDC、SOL/USDT、USDC/USDT 不同 bin_step 的真实池子
-// 用户可以用 /addpool 加新池子(在 DB 里)
 const CANDIDATE_POOLS_DEFAULT: string[] = [
   'BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y', // SOL/USDC bin_step 10
-  // 注:其他池子地址 bot 启动时会自动从 datapi 或 user 输入扩展
+  '5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6', // SOL/USDC active pool (Pool Age 2y+)
+  'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq', // USDC/USDT (SDK 文档示例)
 ];
 
 // ============================================================
@@ -1144,6 +1144,7 @@ bot.command('help', async (ctx) => {
     `/confirm - 确认待执行操作\n` +
     `/cancel - 取消待执行操作\n\n` +
     `<b>池子管理</b>\n` +
+    `/discover - 自动抓 Meteora top 池子加入候选\n` +
     `/addpool &lt;addr&gt; - 加候选池\n` +
     `/rmpool &lt;addr&gt; - 移除候选池\n\n` +
     `<i>V0.1 Step 3</i>`,
@@ -1423,6 +1424,84 @@ bot.command('cancel', async (ctx) => {
   await ctx.reply('已取消');
 });
 
+/**
+ * /discover - 自动从 GeckoTerminal 抓 Meteora DLMM 池子,挑符合白名单的加入候选
+ * 没有参数:抓 top 100 个 24h volume 最高的池子,过滤白名单 + 加入候选
+ */
+bot.command('discover', async (ctx) => {
+  await ctx.reply('🔍 Discovering pools from GeckoTerminal (this takes ~30s)...');
+  let added = 0, skipped = 0, errors = 0;
+  const targetTokenSets: Set<string>[] = [
+    new Set([SOL_MINT, USDC_MINT]),
+    new Set([SOL_MINT, USDT_MINT]),
+    new Set([USDC_MINT, USDT_MINT]),
+  ];
+
+  try {
+    // 抓 4 页(每页 20 个),按 24h vol 排序
+    const candidates: Array<{ address: string; name: string; vol: number; tvl: number }> = [];
+    for (let page = 1; page <= 4; page++) {
+      const url = `${CONFIG.GECKOTERMINAL_API}/networks/solana/dexes/meteora/pools?page=${page}&sort=h24_volume_usd_desc`;
+      try {
+        const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+        if (!r.ok) {
+          errors++;
+          break;
+        }
+        const data: any = await r.json();
+        for (const p of data?.data || []) {
+          const a = p.attributes;
+          const baseMint: string = (p.relationships?.base_token?.data?.id || '').replace('solana_', '');
+          const quoteMint: string = (p.relationships?.quote_token?.data?.id || '').replace('solana_', '');
+          candidates.push({
+            address: a.address,
+            name: a.name,
+            vol: parseFloat(a.volume_usd?.h24 || '0'),
+            tvl: parseFloat(a.reserve_in_usd || '0'),
+          });
+          // 检查 token 对是否在白名单组合
+          const tokenSet = new Set([baseMint, quoteMint]);
+          const matches = targetTokenSets.some(target =>
+            target.size === tokenSet.size && [...target].every(x => tokenSet.has(x))
+          );
+          if (!matches) { skipped++; continue; }
+
+          // 加入 DB(去重)
+          const existing = await db.query(`SELECT 1 FROM candidate_pools WHERE lb_pair=$1`, [a.address]);
+          if (existing.rows.length === 0) {
+            await db.query(
+              `INSERT INTO candidate_pools(lb_pair) VALUES($1) ON CONFLICT DO NOTHING`,
+              [a.address]
+            );
+            added++;
+          } else {
+            // 已存在,确保启用
+            await db.query(`UPDATE candidate_pools SET enabled=TRUE WHERE lb_pair=$1`, [a.address]);
+          }
+        }
+      } catch (e: any) {
+        console.error(`discover page ${page}: ${e.message}`);
+        errors++;
+      }
+      await sleep(1500); // GT 30 RPM 限流
+    }
+
+    state.candidatePools = await loadCandidatePools();
+    await ctx.reply(
+      `✅ <b>Discovery 完成</b>\n\n` +
+      `扫描了 ${candidates.length} 个 Meteora 池\n` +
+      `符合白名单加入: <b>${added}</b>\n` +
+      `跳过(非白名单 token): ${skipped}\n` +
+      `错误页: ${errors}\n\n` +
+      `当前候选池总数: <b>${state.candidatePools.length}</b>\n\n` +
+      `下一步: /scan 看打分`,
+      { parse_mode: 'HTML' }
+    );
+  } catch (e: any) {
+    await ctx.reply(`❌ ${e.message}`);
+  }
+});
+
 bot.command('addpool', async (ctx) => {
   const args = ctx.message.text.split(/\s+/).slice(1);
   if (!args[0]) { await ctx.reply('用法: /addpool <addr>'); return; }
@@ -1525,8 +1604,8 @@ async function start() {
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n\n` +
     `下一步:\n` +
-    `1. /scan 看候选池打分\n` +
-    `2. /addpool &lt;地址&gt; 加更多池子\n` +
+    `1. /discover 自动抓 top 池子(推荐)\n` +
+    `2. /scan 看候选池打分\n` +
     `3. DRY_RUN=true 时可以放心 /auto on 测试\n` +
     `4. 验证逻辑没问题后 Railway 改 DRY_RUN=false 上实盘\n\n` +
     `/help 查看所有命令`
