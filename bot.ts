@@ -254,13 +254,18 @@ async function initDb() {
       score NUMERIC,
       ts TIMESTAMPTZ DEFAULT NOW()
     );
+    -- migration: 旧表可能没有 score 列
+    ALTER TABLE pool_metrics ADD COLUMN IF NOT EXISTS score NUMERIC;
     CREATE INDEX IF NOT EXISTS idx_pool_metrics_pair_ts ON pool_metrics(lb_pair, ts DESC);
 
     CREATE TABLE IF NOT EXISTS candidate_pools (
       lb_pair TEXT PRIMARY KEY,
       added_at TIMESTAMPTZ DEFAULT NOW(),
-      enabled BOOLEAN DEFAULT TRUE
+      enabled BOOLEAN DEFAULT TRUE,
+      disabled_reason TEXT
     );
+    -- migration: 加 disabled_reason 列(用于自动禁用坏池子)
+    ALTER TABLE candidate_pools ADD COLUMN IF NOT EXISTS disabled_reason TEXT;
   `);
   // seed default candidates
   for (const addr of CANDIDATE_POOLS_DEFAULT) {
@@ -658,7 +663,18 @@ async function scanPools(): Promise<ScoredPool[]> {
         [addr, info.activeBinId, info.activePrice, info.tvlUsd, info.volume24hUsd, info.fees24hUsd, info.feeApr, score]
       );
     } catch (e: any) {
-      console.error(`scanPools: ${addr} failed: ${e.message}`);
+      const msg = e.message || String(e);
+      console.error(`scanPools: ${addr} failed: ${msg}`);
+      // 自动 disable 永久性失败的池子(比如非 DLMM 账户)
+      if (msg.includes('Invalid account discriminator') ||
+          msg.includes('Account does not exist') ||
+          msg.includes('AccountNotFound')) {
+        await db.query(
+          `UPDATE candidate_pools SET enabled=FALSE, disabled_reason=$2 WHERE lb_pair=$1`,
+          [addr, msg.slice(0, 200)]
+        );
+        console.log(`Auto-disabled ${addr}: ${msg.slice(0, 80)}`);
+      }
     }
   }
 
