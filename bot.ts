@@ -57,7 +57,8 @@ const CONFIG = {
   REBALANCE_THRESHOLD: 0.45,
   CLAIM_THRESHOLD_PCT: 1.0,
   CHECK_INTERVAL_MS: 30_000,
-  SCAN_INTERVAL_MS: 4 * 60 * 60_000, // 4h
+  SCAN_INTERVAL_MS: 30 * 60_000,     // 30min (V0.1 开发期紧凑值,V0.2 生产期可调到 4h)
+  AUTO_TICK_EVERY_N_LOOPS: 4,        // 每 4 个 loop (~2 分钟) 触发 tickAutoOpen
   SWITCH_SCORE_DIFF: 20,             // 新池分高 20+ 才换仓
 
   // Tx
@@ -1160,6 +1161,7 @@ bot.command('help', async (ctx) => {
     `/pnl - 盈亏报表\n\n` +
     `<b>控制</b>\n` +
     `/auto on|off - 全自动开关\n` +
+    `/now - 立刻触发一次自动决策(测试用)\n` +
     `/open &lt;addr&gt; &lt;amount_usd&gt; - 手动开仓\n` +
     `/close &lt;position_pk&gt; - 手动关仓\n` +
     `/pause - 暂停所有自动动作\n` +
@@ -1351,7 +1353,8 @@ bot.command('auto', async (ctx) => {
   if (cmd === 'on') {
     state.autoTrading = true;
     state.paused = false;
-    await ctx.reply(`🟢 Auto ON${CONFIG.DRY_RUN ? ' (DRY_RUN)' : ''}`);
+    state.lastScanTs = 0;  // 清缓存,让下次 tick 立刻扫描
+    await ctx.reply(`🟢 Auto ON${CONFIG.DRY_RUN ? ' (DRY_RUN)' : ''}\n下次自动扫描将在 2 分钟内触发(发 /now 立刻触发)`);
     await logEvent('auto_on', {});
   } else if (cmd === 'off') {
     state.autoTrading = false;
@@ -1359,6 +1362,25 @@ bot.command('auto', async (ctx) => {
     await logEvent('auto_off', {});
   } else {
     await ctx.reply(`auto = ${state.autoTrading ? 'on' : 'off'}\n用法: /auto on|off`);
+  }
+});
+
+/**
+ * /now - 立刻触发一次自动决策(忽略 SCAN_INTERVAL_MS 缓存)
+ * 用于测试或者你不想等 2 分钟
+ */
+bot.command('now', async (ctx) => {
+  if (!state.autoTrading) {
+    await ctx.reply('⚪ Auto 是 OFF,先 /auto on');
+    return;
+  }
+  await ctx.reply('⏳ 立刻触发自动决策...');
+  state.lastScanTs = 0;  // 强制重扫
+  try {
+    await tickAutoOpen();
+    await ctx.reply('✅ tickAutoOpen 完成,看上方的扫描结果或确认请求');
+  } catch (e: any) {
+    await ctx.reply(`❌ ${e.message}`);
   }
 });
 
@@ -1581,8 +1603,8 @@ async function mainLoop() {
       tickCounter++;
       console.log(`[loop ${tickCounter}] paused=${state.paused} auto=${state.autoTrading} positions...`);
       await tickPositions();
-      // tickAutoOpen 每 20 个 loop 跑一次(约 10 分钟)
-      if (tickCounter % 20 === 0) {
+      // tickAutoOpen 每 N 个 loop 跑一次
+      if (tickCounter % CONFIG.AUTO_TICK_EVERY_N_LOOPS === 0) {
         await tickAutoOpen();
       }
     } catch (e: any) {
