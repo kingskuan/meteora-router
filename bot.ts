@@ -1,12 +1,12 @@
 /**
  * Meteora Router - DLMM Auto Rebalance Bot
- * V0.1 - Step 1: TG bot skeleton
+ * V0.1 - Step 1: TG bot skeleton + Postgres connection check
  */
 
 import 'dotenv/config';
 import { Connection, Keypair, PublicKey } from '@solana/web3.js';
 import { Telegraf } from 'telegraf';
-import { createClient } from '@supabase/supabase-js';
+import { Pool } from 'pg';
 import bs58 from 'bs58';
 import express from 'express';
 
@@ -18,11 +18,10 @@ const CONFIG = {
 
   // Telegram
   TG_BOT_TOKEN: process.env.TG_BOT_TOKEN || '',
-  TG_OWNER_ID: parseInt(process.env.TG_OWNER_ID || '0'), // 只允许这个 user id 用
+  TG_OWNER_ID: parseInt(process.env.TG_OWNER_ID || '0'),
 
-  // Supabase
-  SUPABASE_URL: process.env.SUPABASE_URL || '',
-  SUPABASE_KEY: process.env.SUPABASE_SERVICE_KEY || '',
+  // Railway Postgres (Railway 自动注入 DATABASE_URL)
+  DATABASE_URL: process.env.DATABASE_URL || '',
 
   // Strategy (V1 默认值,后面 step 用)
   POOL_SOL_USDC: 'Cx7yrtKrQQVgptC76fnmcoJg4xDLLR4yJhqsTbW6yLqo', // SOL/USDC bin_step 20
@@ -49,10 +48,44 @@ function loadKeypair(): Keypair {
 
 const wallet = loadKeypair();
 const connection = new Connection(CONFIG.RPC_URL, 'confirmed');
-const supabase = createClient(CONFIG.SUPABASE_URL, CONFIG.SUPABASE_KEY);
 const bot = new Telegraf(CONFIG.TG_BOT_TOKEN);
 
+// Postgres 连接池
+// Railway 内网走 SSL 模式 (Railway 推荐设置)
+const db = new Pool({
+  connectionString: CONFIG.DATABASE_URL,
+  ssl: CONFIG.DATABASE_URL.includes('railway.app') || CONFIG.DATABASE_URL.includes('rlwy.net')
+    ? { rejectUnauthorized: false }
+    : false,
+  max: 5,
+  idleTimeoutMillis: 30_000,
+});
+
 console.log(`🤖 Wallet: ${wallet.publicKey.toBase58()}`);
+
+// ============ 数据库 ============
+async function initDb() {
+  // 用 IF NOT EXISTS 安全幂等,Step 2 会扩展更多表
+  await db.query(`
+    CREATE TABLE IF NOT EXISTS events (
+      id SERIAL PRIMARY KEY,
+      type TEXT NOT NULL,
+      payload JSONB,
+      ts TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
+  `);
+  console.log('🗄️  DB schema ready');
+}
+
+async function logEvent(type: string, payload: any = {}) {
+  try {
+    await db.query('INSERT INTO events(type, payload) VALUES($1, $2)', [type, payload]);
+  } catch (e: any) {
+    console.error(`Failed to log event: ${e.message}`);
+  }
+}
 
 // ============ 通知层 ============
 async function notify(msg: string) {
@@ -83,11 +116,24 @@ bot.command('ping', async (ctx) => {
 bot.command('status', async (ctx) => {
   const balance = await connection.getBalance(wallet.publicKey);
   const solBalance = (balance / 1e9).toFixed(4);
+
+  // DB 连通性测试
+  let dbStatus = '❌';
+  let eventCount = 0;
+  try {
+    const r = await db.query('SELECT COUNT(*) as c FROM events');
+    eventCount = parseInt(r.rows[0].c);
+    dbStatus = '✅';
+  } catch (e: any) {
+    dbStatus = `❌ ${e.message}`;
+  }
+
   await ctx.reply(
     `<b>📊 Status</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
     `SOL Balance: ${solBalance}\n` +
     `RPC: ${CONFIG.RPC_URL.includes('helius') ? 'Helius ✅' : 'Default ⚠️'}\n` +
+    `DB: ${dbStatus} (${eventCount} events)\n` +
     `Owner ID: ${CONFIG.TG_OWNER_ID}\n` +
     `\n<i>Step 1 - TG bot skeleton</i>`,
     { parse_mode: 'HTML' }
@@ -98,7 +144,7 @@ bot.command('help', async (ctx) => {
   await ctx.reply(
     `<b>🤖 Meteora Router Commands</b>\n\n` +
     `/ping - 测试连接\n` +
-    `/status - 钱包状态\n` +
+    `/status - 钱包 + DB 状态\n` +
     `/help - 这个帮助\n` +
     `\n<i>更多命令在后续 step 加入</i>`,
     { parse_mode: 'HTML' }
@@ -107,8 +153,13 @@ bot.command('help', async (ctx) => {
 
 // ============ 健康检查 (给 UptimeRobot) ============
 const app = express();
-app.get('/health', (req, res) => {
-  res.json({ ok: true, ts: Date.now() });
+app.get('/health', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    res.json({ ok: true, db: 'ok', ts: Date.now() });
+  } catch (e: any) {
+    res.status(503).json({ ok: false, db: e.message, ts: Date.now() });
+  }
 });
 app.listen(CONFIG.PORT, () => {
   console.log(`🩺 Health endpoint on :${CONFIG.PORT}/health`);
@@ -139,6 +190,10 @@ async function start() {
     console.error('Uncaught exception:', err);
     await notify(`🚨 Uncaught exception: ${err?.message || err}`);
   });
+
+  // 初始化 DB
+  await initDb();
+  await logEvent('boot', { wallet: wallet.publicKey.toBase58(), ts: Date.now() });
 
   // 启动 TG bot
   bot.launch();
