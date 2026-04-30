@@ -881,14 +881,68 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
   const xAmountFloat = xUsdPerSide / (xPrice || 1);
   const yAmountFloat = yUsdPerSide / (yPrice || 1);
 
+  // ============ 资金路由:先 swap 补齐缺口 ============
+  // 例:钱包 SOL=0.5 USDC=510,但 $200 仓位需要 1.25 SOL + 100 USDC
+  // → 缺 0.75 SOL,从 USDC swap 补齐
+  if (!CONFIG.DRY_RUN) {
+    const xBal = await getSplBalance(tokenXMint, xDec);
+    const yBal = await getSplBalance(tokenYMint, yDec);
+    // SOL 是原生 token,需要单独读 lamports
+    const xBalReal = tokenXMint === SOL_MINT ? (await connection.getBalance(wallet.publicKey)) / 1e9 : xBal;
+    const yBalReal = tokenYMint === SOL_MINT ? (await connection.getBalance(wallet.publicKey)) / 1e9 : yBal;
+
+    // 留 0.05 SOL 做 gas
+    const xUsable = tokenXMint === SOL_MINT ? Math.max(0, xBalReal - 0.05) : xBalReal;
+    const yUsable = tokenYMint === SOL_MINT ? Math.max(0, yBalReal - 0.05) : yBalReal;
+
+    const xShortfall = Math.max(0, xAmountFloat - xUsable);
+    const yShortfall = Math.max(0, yAmountFloat - yUsable);
+
+    if (xShortfall > 0 && yShortfall > 0) {
+      throw new Error(`两个 token 都不够: 缺 ${xShortfall.toFixed(4)} ${tokenSymbol(tokenXMint)} 和 ${yShortfall.toFixed(2)} ${tokenSymbol(tokenYMint)}`);
+    }
+
+    // 哪个不够就从另一个 swap 一些过来,加 1% buffer 防滑点
+    if (xShortfall > 0) {
+      const xUsdNeeded = xShortfall * xPrice * 1.01;
+      const ySwapAmount = xUsdNeeded / yPrice;
+      if (ySwapAmount > yUsable) {
+        throw new Error(`${tokenSymbol(tokenYMint)} 不够 swap 补 ${tokenSymbol(tokenXMint)}: 需要 ${ySwapAmount.toFixed(2)},有 ${yUsable.toFixed(2)}`);
+      }
+      await notify(
+        `🔄 <b>资金路由</b>\n` +
+        `swap ${ySwapAmount.toFixed(2)} ${tokenSymbol(tokenYMint)} → ${tokenSymbol(tokenXMint)}\n` +
+        `(缺 ${xShortfall.toFixed(4)} ${tokenSymbol(tokenXMint)})`
+      );
+      const swapAmountRaw = new BN(Math.floor(ySwapAmount * Math.pow(10, yDec)));
+      const { sig: swapSig } = await jupSwap(tokenYMint, tokenXMint, swapAmountRaw);
+      await notify(`✅ swap tx: <code>${swapSig}</code>`);
+      await sleep(3000); // 等链上结算
+    } else if (yShortfall > 0) {
+      const yUsdNeeded = yShortfall * yPrice * 1.01;
+      const xSwapAmount = yUsdNeeded / xPrice;
+      if (xSwapAmount > xUsable) {
+        throw new Error(`${tokenSymbol(tokenXMint)} 不够 swap 补 ${tokenSymbol(tokenYMint)}: 需要 ${xSwapAmount.toFixed(4)},有 ${xUsable.toFixed(4)}`);
+      }
+      await notify(
+        `🔄 <b>资金路由</b>\n` +
+        `swap ${xSwapAmount.toFixed(4)} ${tokenSymbol(tokenXMint)} → ${tokenSymbol(tokenYMint)}\n` +
+        `(缺 ${yShortfall.toFixed(2)} ${tokenSymbol(tokenYMint)})`
+      );
+      const swapAmountRaw = new BN(Math.floor(xSwapAmount * Math.pow(10, xDec)));
+      const { sig: swapSig } = await jupSwap(tokenXMint, tokenYMint, swapAmountRaw);
+      await notify(`✅ swap tx: <code>${swapSig}</code>`);
+      await sleep(3000);
+    }
+  }
+
   const totalXAmount = new BN(Math.floor(xAmountFloat * Math.pow(10, xDec)));
   const totalYAmount = new BN(Math.floor(yAmountFloat * Math.pow(10, yDec)));
 
-  // 检查钱包余额(skip in DRY_RUN)
+  // 最终钱包余额检查(实盘)
   if (!CONFIG.DRY_RUN) {
     const solBal = await connection.getBalance(wallet.publicKey);
     if (solBal < 0.05 * 1e9) throw new Error(`SOL 余额不足: ${(solBal / 1e9).toFixed(4)} SOL`);
-    // 这里简化:不做 SPL 余额检查,假设 swap 步骤会处理
   }
 
   await notify(
