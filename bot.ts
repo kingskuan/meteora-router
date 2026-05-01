@@ -427,7 +427,13 @@ async function getWalletSnapshot(): Promise<WalletSnapshot> {
   const usdcBalance = await getSplBalance(USDC_MINT, 6);
   const usdtBalance = await getSplBalance(USDT_MINT, 6);
 
-  const gasReserveSol = 0.05; // 留 0.05 SOL 给 gas
+  // 留 0.1 SOL 给 gas + rent
+  // - gas: ~0.001 SOL/tx
+  // - position account rent: ~0.057 SOL(关仓退回)
+  // - WSOL ATA rent: ~0.002 SOL
+  // - bin array rent (if needed): ~0.07 SOL
+  // 0.1 SOL 是安全 buffer,实际 rent 占用关仓时退回
+  const gasReserveSol = 0.1;
   const usableSol = Math.max(0, solBalance - gasReserveSol);
   const solUsd = usableSol * solPrice;
   const totalUsableUsd = solUsd + usdcBalance + usdtBalance;
@@ -935,9 +941,9 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
     const xBalReal = tokenXMint === SOL_MINT ? (await connection.getBalance(wallet.publicKey)) / 1e9 : xBal;
     const yBalReal = tokenYMint === SOL_MINT ? (await connection.getBalance(wallet.publicKey)) / 1e9 : yBal;
 
-    // 留 0.05 SOL 做 gas
-    const xUsable = tokenXMint === SOL_MINT ? Math.max(0, xBalReal - 0.05) : xBalReal;
-    const yUsable = tokenYMint === SOL_MINT ? Math.max(0, yBalReal - 0.05) : yBalReal;
+    // 留 0.1 SOL 做 gas + rent
+    const xUsable = tokenXMint === SOL_MINT ? Math.max(0, xBalReal - 0.1) : xBalReal;
+    const yUsable = tokenYMint === SOL_MINT ? Math.max(0, yBalReal - 0.1) : yBalReal;
 
     const xShortfall = Math.max(0, xAmountFloat - xUsable);
     const yShortfall = Math.max(0, yAmountFloat - yUsable);
@@ -986,7 +992,7 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
   // 最终钱包余额检查(实盘)
   if (!CONFIG.DRY_RUN) {
     const solBal = await connection.getBalance(wallet.publicKey);
-    if (solBal < 0.05 * 1e9) throw new Error(`SOL 余额不足: ${(solBal / 1e9).toFixed(4)} SOL`);
+    if (solBal < 0.1 * 1e9) throw new Error(`SOL 余额不足: ${(solBal / 1e9).toFixed(4)} SOL (需要 ≥ 0.1 SOL 含 rent)`);
   }
 
   await notify(
