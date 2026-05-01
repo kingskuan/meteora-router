@@ -1247,21 +1247,42 @@ async function tickAutoOpen() {
     return;
   }
 
-  const best = eligible[0];
+  // 遍历 eligible(已按分数从高到低排),选第一个能开的
+  let chosen: ScoredPool | null = null;
+  const skipReasons: string[] = [];
+  for (const candidate of eligible) {
+    // 冷却期检查
+    const cool = await db.query(
+      `SELECT 1 FROM positions WHERE lb_pair = $1 AND status = 'closed' AND closed_at > NOW() - INTERVAL '${CONFIG.POOL_COOLDOWN_MINUTES} minutes' LIMIT 1`,
+      [candidate.info.address]
+    );
+    if (cool.rows.length > 0) {
+      skipReasons.push(`${candidate.info.pairName} bin_step ${candidate.info.binStep}: 冷却期`);
+      continue;
+    }
+    // 已在该池开仓 → 跳过
+    const dup = await db.query(`SELECT 1 FROM positions WHERE lb_pair=$1 AND status='open' LIMIT 1`, [candidate.info.address]);
+    if (dup.rows.length > 0) {
+      skipReasons.push(`${candidate.info.pairName} bin_step ${candidate.info.binStep}: 已持仓`);
+      continue;
+    }
+    chosen = candidate;
+    break;
+  }
 
-  // 冷却期检查
-  const cool = await db.query(
-    `SELECT 1 FROM positions WHERE lb_pair = $1 AND status = 'closed' AND closed_at > NOW() - INTERVAL '${CONFIG.POOL_COOLDOWN_MINUTES} minutes' LIMIT 1`,
-    [best.info.address]
-  );
-  if (cool.rows.length > 0) {
-    await notify(`池子 ${best.info.pairName} 在冷却期,跳过`);
+  if (!chosen) {
+    await notify(
+      `⚠️ <b>无可开仓位</b>\n\n` +
+      `${eligible.length} 个池子通过硬筛,但全部跳过:\n` +
+      skipReasons.map(r => `• ${escHtml(r)}`).join('\n')
+    );
     return;
   }
 
-  // 已在该池开仓 → 跳过
-  const dup = await db.query(`SELECT 1 FROM positions WHERE lb_pair=$1 AND status='open' LIMIT 1`, [best.info.address]);
-  if (dup.rows.length > 0) return;
+  const best = chosen;
+  if (skipReasons.length > 0) {
+    await notify(`ℹ️ 跳过 ${skipReasons.length} 个池子,选 ${best.info.pairName} bin_step ${best.info.binStep} (score ${best.score.toFixed(1)})`);
+  }
 
   // 计算可投金额(40% of total usable = SOL+USDC+USDT,封顶 MAX_POSITION_USD)
   const wallet_ = await getWalletSnapshot();
