@@ -1253,6 +1253,19 @@ async function tickAutoOpen() {
     return;
   }
 
+  // 已持仓的 token pair (规范化排序,避免 X/Y 顺序差异)
+  const heldPairsR = await db.query<{ lb_pair: string }>(
+    `SELECT lb_pair FROM positions WHERE status = 'open'`
+  );
+  const heldPairKeys = new Set<string>();
+  for (const row of heldPairsR.rows) {
+    try {
+      const info = await getPoolInfo(row.lb_pair);
+      const key = [info.tokenXMint, info.tokenYMint].sort().join('|');
+      heldPairKeys.add(key);
+    } catch {}
+  }
+
   // 遍历 eligible(已按分数从高到低排),选第一个能开的
   let chosen: ScoredPool | null = null;
   const skipReasons: string[] = [];
@@ -1270,6 +1283,12 @@ async function tickAutoOpen() {
     const dup = await db.query(`SELECT 1 FROM positions WHERE lb_pair=$1 AND status='open' LIMIT 1`, [candidate.info.address]);
     if (dup.rows.length > 0) {
       skipReasons.push(`${candidate.info.pairName} bin_step ${candidate.info.binStep}: 已持仓`);
+      continue;
+    }
+    // 已在同 token pair 持仓 → 跳过(避免同对不同 bin_step 重复开仓)
+    const candidateKey = [candidate.info.tokenXMint, candidate.info.tokenYMint].sort().join('|');
+    if (heldPairKeys.has(candidateKey)) {
+      skipReasons.push(`${candidate.info.pairName} bin_step ${candidate.info.binStep}: 同对已持仓`);
       continue;
     }
     chosen = candidate;
@@ -1292,7 +1311,18 @@ async function tickAutoOpen() {
 
   // 计算可投金额(40% of total usable = SOL+USDC+USDT,封顶 MAX_POSITION_USD)
   const wallet_ = await getWalletSnapshot();
-  const investUsd = Math.min(wallet_.totalUsableUsd * 0.4, CONFIG.MAX_POSITION_USD);
+  let investUsd = Math.min(wallet_.totalUsableUsd * 0.4, CONFIG.MAX_POSITION_USD);
+
+  // 如果池子涉及 SOL,投资金额还要被 SOL 可用量限制
+  // (因为 50/50 仓位需要的 SOL 不能超过可用 SOL)
+  const poolHasSol = best.info.tokenXMint === SOL_MINT || best.info.tokenYMint === SOL_MINT;
+  if (poolHasSol) {
+    const maxByAvailableSol = wallet_.solUsd * 2 * 0.95; // 留 5% buffer 防 SOL 价格波动
+    if (investUsd > maxByAvailableSol) {
+      console.log(`[tickAutoOpen] SOL-cap: ${fmtUsd(investUsd)} → ${fmtUsd(maxByAvailableSol)}`);
+      investUsd = maxByAvailableSol;
+    }
+  }
 
   if (investUsd < 5) {
     await notify(
