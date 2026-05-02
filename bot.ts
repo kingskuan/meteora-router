@@ -33,6 +33,7 @@ import bs58 from 'bs58';
 import express from 'express';
 import DLMM, { StrategyType } from '@meteora-ag/dlmm';
 import BN from 'bn.js';
+import Decimal from 'decimal.js';
 
 // ============================================================
 // 1. 配置
@@ -511,6 +512,218 @@ function calcBaseFeePct(baseFactor: number, binStep: number, powerFactor: number
   return (baseFactor * binStep * 10 * Math.pow(10, powerFactor)) / 1e9 * 100;
 }
 
+// ============================================================
+// 8b. 链上 Swap Event 解析器 (V0.1.1)
+// ============================================================
+//
+// Meteora DLMM program emits "Swap" anchor event in tx logs as:
+//   Program data: <base64-encoded-bytes>
+// where bytes = [8-byte event discriminator] + [Borsh-encoded fields]
+//
+// Swap event schema (from IDL):
+//   lb_pair: pubkey (32)
+//   from: pubkey (32)
+//   start_bin_id: i32 (4)
+//   end_bin_id: i32 (4)
+//   amount_in: u64 (8)
+//   amount_out: u64 (8)
+//   swap_for_y: bool (1)
+//   fee: u64 (8)
+//   protocol_fee: u64 (8)
+//   fee_bps: u128 (16)
+//   host_fee: u64 (8)
+//
+// Total: 8 (disc) + 32 + 32 + 4 + 4 + 8 + 8 + 1 + 8 + 8 + 16 + 8 = 137 bytes
+//
+// 我们手写 decoder 避开 Anchor BorshCoder 对 IDL 严格性问题。
+
+const METEORA_PROGRAM_ID = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
+const SWAP_EVENT_DISCRIMINATOR = Buffer.from([81, 108, 227, 190, 205, 208, 10, 196]);
+
+interface DlmmSwapEvent {
+  lbPair: string;
+  from: string;
+  startBinId: number;
+  endBinId: number;
+  amountIn: bigint;
+  amountOut: bigint;
+  swapForY: boolean;
+  fee: bigint;
+  protocolFee: bigint;
+  hostFee: bigint;
+}
+
+/**
+ * 从 tx logs 中找 Swap event 并 decode
+ */
+function parseSwapEventFromLogs(logs: string[]): DlmmSwapEvent[] {
+  const events: DlmmSwapEvent[] = [];
+  for (const log of logs) {
+    if (!log.startsWith('Program data: ')) continue;
+    let data: Buffer;
+    try {
+      data = Buffer.from(log.slice('Program data: '.length), 'base64');
+    } catch {
+      continue;
+    }
+    if (data.length < 137) continue;
+    if (!data.slice(0, 8).equals(SWAP_EVENT_DISCRIMINATOR)) continue;
+
+    let off = 8;
+    const lbPair = new PublicKey(data.slice(off, off + 32)).toBase58(); off += 32;
+    const from = new PublicKey(data.slice(off, off + 32)).toBase58(); off += 32;
+    const startBinId = data.readInt32LE(off); off += 4;
+    const endBinId = data.readInt32LE(off); off += 4;
+    const amountIn = data.readBigUInt64LE(off); off += 8;
+    const amountOut = data.readBigUInt64LE(off); off += 8;
+    const swapForY = data.readUInt8(off) === 1; off += 1;
+    const fee = data.readBigUInt64LE(off); off += 8;
+    const protocolFee = data.readBigUInt64LE(off); off += 8;
+    off += 16;  // skip fee_bps (u128)
+    const hostFee = data.readBigUInt64LE(off); off += 8;
+
+    events.push({ lbPair, from, startBinId, endBinId, amountIn, amountOut, swapForY, fee, protocolFee, hostFee });
+  }
+  return events;
+}
+
+interface OnchainFeeStats {
+  fees24hUsd: number;
+  volume24hUsd: number;
+  feeApr: number | null;
+  swapCount: number;
+  source: 'onchain';
+}
+
+// 缓存:lbPair → { stats, ts }
+const onchainFeeCache = new Map<string, { stats: OnchainFeeStats; ts: number }>();
+const ONCHAIN_FEE_CACHE_MS = 30 * 60_000;  // 30 min
+
+/**
+ * 从链上 swap events 计算池子过去 N 小时的真实 fee + volume
+ *
+ * 方法:getSignaturesForAddress 拿 N 小时内 tx → getTransactions 批量解析 → 累加 fee
+ *
+ * @param lbPair pool address
+ * @param tvlUsd 池子 TVL (用于算 APR)
+ * @param tokenXPrice X token 美元价
+ * @param tokenYPrice Y token 美元价
+ * @param tokenXDec X 精度
+ * @param tokenYDec Y 精度
+ * @param hours 回看时长(默认 24h)
+ */
+async function getOnchainFeeStats(
+  lbPair: string,
+  tvlUsd: number,
+  tokenXPrice: number,
+  tokenYPrice: number,
+  tokenXDec: number,
+  tokenYDec: number,
+  hours: number = 24,
+): Promise<OnchainFeeStats> {
+
+  // 缓存
+  const cached = onchainFeeCache.get(lbPair);
+  if (cached && Date.now() - cached.ts < ONCHAIN_FEE_CACHE_MS) {
+    return cached.stats;
+  }
+
+  const cutoffTs = Math.floor(Date.now() / 1000) - hours * 3600;
+  const lbPairPk = new PublicKey(lbPair);
+
+  // 1. 拿过去 N 小时的 tx signatures (Helius 默认上限 1000 per call)
+  let allSigs: any[] = [];
+  let beforeSig: string | undefined = undefined;
+  let pages = 0;
+  while (pages < 5) {
+    const batch: any = await retry(() => connection.getSignaturesForAddress(
+      lbPairPk,
+      { limit: 1000, before: beforeSig },
+      'confirmed',
+    ), 2, 500);
+    if (!batch || batch.length === 0) break;
+    pages++;
+    let stop = false;
+    for (const s of batch) {
+      if ((s.blockTime ?? 0) < cutoffTs) { stop = true; break; }
+      allSigs.push(s);
+    }
+    if (stop) break;
+    if (batch.length < 1000) break;
+    beforeSig = batch[batch.length - 1].signature;
+  }
+
+  if (allSigs.length === 0) {
+    const empty: OnchainFeeStats = { fees24hUsd: 0, volume24hUsd: 0, feeApr: null, swapCount: 0, source: 'onchain' };
+    onchainFeeCache.set(lbPair, { stats: empty, ts: Date.now() });
+    return empty;
+  }
+
+  // 2. 分批 getTransaction (limit 限速)
+  const BATCH_SIZE = 25;
+  let totalFeeXRaw = 0n;
+  let totalFeeYRaw = 0n;
+  let totalAmountInXRaw = 0n;
+  let totalAmountInYRaw = 0n;
+  let swapCount = 0;
+
+  for (let i = 0; i < allSigs.length; i += BATCH_SIZE) {
+    const batch = allSigs.slice(i, i + BATCH_SIZE);
+    const txs = await retry(() => connection.getTransactions(
+      batch.map(s => s.signature),
+      { maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
+    ), 2, 500);
+
+    for (const tx of (txs || [])) {
+      const logs = tx?.meta?.logMessages;
+      if (!logs) continue;
+      const events = parseSwapEventFromLogs(logs);
+      for (const ev of events) {
+        if (ev.lbPair !== lbPair) continue;
+        swapCount++;
+        // swap_for_y=true 表示 X→Y, fee 是 input token (X) 计价
+        if (ev.swapForY) {
+          totalFeeXRaw += ev.fee;
+          totalAmountInXRaw += ev.amountIn;
+        } else {
+          totalFeeYRaw += ev.fee;
+          totalAmountInYRaw += ev.amountIn;
+        }
+      }
+    }
+    await sleep(150);  // 简单 rate limit
+  }
+
+  // 3. 转 USD
+  const feeXUsd = (Number(totalFeeXRaw) / Math.pow(10, tokenXDec)) * tokenXPrice;
+  const feeYUsd = (Number(totalFeeYRaw) / Math.pow(10, tokenYDec)) * tokenYPrice;
+  const fees24hUsd = feeXUsd + feeYUsd;
+
+  const volXUsd = (Number(totalAmountInXRaw) / Math.pow(10, tokenXDec)) * tokenXPrice;
+  const volYUsd = (Number(totalAmountInYRaw) / Math.pow(10, tokenYDec)) * tokenYPrice;
+  const volume24hUsd = volXUsd + volYUsd;
+
+  // 按 hours 比例外推到 24h
+  const scale = 24 / hours;
+  const fees24h = fees24hUsd * scale;
+  const vol24h = volume24hUsd * scale;
+
+  const feeApr = (tvlUsd > 0) ? (fees24h * 365 / tvlUsd) * 100 : null;
+
+  const stats: OnchainFeeStats = {
+    fees24hUsd: fees24h,
+    volume24hUsd: vol24h,
+    feeApr,
+    swapCount,
+    source: 'onchain',
+  };
+  onchainFeeCache.set(lbPair, { stats, ts: Date.now() });
+
+  console.log(`[onchain-fee] ${lbPair.slice(0, 8)} ${hours}h: ${swapCount} swaps, fees=$${fees24hUsd.toFixed(2)}, vol=$${volume24hUsd.toFixed(0)}, APR=${feeApr?.toFixed(1) ?? 'N/A'}%`);
+
+  return stats;
+}
+
 async function getPoolInfo(lbPair: string): Promise<PoolInfo> {
   const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
   const activeBin = await dlmmPool.getActiveBin();
@@ -590,6 +803,27 @@ async function getPoolInfo(lbPair: string): Promise<PoolInfo> {
         }
       }
     } catch {}
+  }
+
+  // V0.1.1: 链上 fee 计算覆盖前面的估算
+  // 用过去 6 小时的真实 swap events 算 fee + volume,外推 24h
+  // 如果失败,保留前面的估算值
+  if (info.tvlUsd && info.tvlUsd > 0) {
+    try {
+      const xPrice = await getTokenPriceUsd(tokenXMint);
+      const yPrice = await getTokenPriceUsd(tokenYMint);
+      if (xPrice > 0 && yPrice > 0) {
+        const onchain = await getOnchainFeeStats(lbPair, info.tvlUsd, xPrice, yPrice, xDec, yDec, 6);
+        if (onchain.swapCount > 0) {
+          info.fees24hUsd = onchain.fees24hUsd;
+          info.volume24hUsd = onchain.volume24hUsd;
+          info.feeApr = onchain.feeApr ?? info.feeApr;
+          info.dataSource = (info.dataSource ? info.dataSource + '+onchain' : 'onchain');
+        }
+      }
+    } catch (e: any) {
+      console.error(`[onchain-fee] ${lbPair.slice(0, 8)} failed: ${e.message}`);
+    }
   }
 
   return info;
@@ -834,46 +1068,80 @@ async function sendTx(
 // ============================================================
 
 /**
- * Swap inputMint -> outputMint, returns out amount estimate (UI units)
+ * 在 Meteora DLMM 池子里做 swap(单池,纯链上,无 HTTP 依赖)
+ *
+ * @param dlmmPool 已经初始化好的 DLMM 实例
+ * @param inputMint 输入 token mint
+ * @param outputMint 输出 token mint
+ * @param amountInRaw 输入金额 (raw units, BN)
+ * @returns sig 真实 tx 签名,outAmount 实际拿到的 raw units (BN), priceImpactPct 滑点百分比
  */
-async function jupSwap(inputMint: string, outputMint: string, amountInRaw: BN): Promise<{ sig: string; outAmount: number }> {
-  const slip = CONFIG.SWAP_SLIPPAGE_BPS;
+async function poolSwap(
+  dlmmPool: any,  // DLMM 实例(避免类型导出问题用 any)
+  inputMint: string,
+  outputMint: string,
+  amountInRaw: BN,
+): Promise<{ sig: string; outAmount: BN; priceImpactPct: number }> {
+  const tokenXMint = dlmmPool.tokenX.publicKey.toBase58();
+  const tokenYMint = dlmmPool.tokenY.publicKey.toBase58();
 
-  const quoteUrl = `${CONFIG.JUP_API}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInRaw.toString()}&slippageBps=${slip}`;
-  const quoteRes = await fetch(quoteUrl, { signal: AbortSignal.timeout(8000) });
-  if (!quoteRes.ok) throw new Error(`Jupiter quote ${quoteRes.status}`);
-  const quote: any = await quoteRes.json();
-
-  const outDecimals = KNOWN_TOKENS[outputMint]?.decimals ?? 6;
-  const outAmount = parseFloat(quote.outAmount) / Math.pow(10, outDecimals);
-
-  if (CONFIG.DRY_RUN) {
-    console.log(`[DRY_RUN] would Jupiter swap ${amountInRaw.toString()} ${inputMint} -> ${outAmount} ${outputMint}`);
-    return { sig: 'DRY_RUN_SWAP', outAmount };
+  if (inputMint !== tokenXMint && inputMint !== tokenYMint) {
+    throw new Error(`poolSwap: input ${inputMint} 不在池子里 (${tokenXMint}/${tokenYMint})`);
+  }
+  if (outputMint !== tokenXMint && outputMint !== tokenYMint) {
+    throw new Error(`poolSwap: output ${outputMint} 不在池子里`);
+  }
+  if (inputMint === outputMint) {
+    throw new Error(`poolSwap: input == output`);
   }
 
-  const swapRes = await fetch(`${CONFIG.JUP_API}/swap`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      quoteResponse: quote,
-      userPublicKey: wallet.publicKey.toBase58(),
-      wrapAndUnwrapSol: true,
-      dynamicComputeUnitLimit: true,
-      prioritizationFeeLamports: { priorityLevelWithMaxLamports: { maxLamports: 1_000_000, priorityLevel: 'high' } },
-    }),
-    signal: AbortSignal.timeout(8000),
+  // swapForY = true 表示 X → Y, false 表示 Y → X
+  const swapForY = inputMint === tokenXMint;
+
+  // 1. 拿当前活跃 bin 周围的 binArrays(SDK 默认 3 个,够 99% 情况)
+  const binArrays = await dlmmPool.getBinArrayForSwap(swapForY);
+
+  if (!binArrays || binArrays.length === 0) {
+    throw new Error('poolSwap: no binArrays for swap (流动性不足)');
+  }
+
+  // 2. quote
+  const slippageBps = new BN(CONFIG.SWAP_SLIPPAGE_BPS);
+  const swapQuote = dlmmPool.swapQuote(amountInRaw, swapForY, slippageBps, binArrays, true /* allow partial fill */);
+
+  // 3. 滑点检查(SwapQuote.priceImpact 是 Decimal)
+  const priceImpactPct = parseFloat(swapQuote.priceImpact.toFixed(4)) * 100;
+  if (priceImpactPct > 1.5) {
+    throw new Error(`poolSwap: 滑点过大 ${priceImpactPct.toFixed(2)}% > 1.5%`);
+  }
+
+  if (CONFIG.DRY_RUN) {
+    console.log(`[DRY_RUN] would poolSwap ${amountInRaw.toString()} ${inputMint.slice(0, 8)} -> ${swapQuote.outAmount.toString()} ${outputMint.slice(0, 8)} (impact ${priceImpactPct.toFixed(3)}%)`);
+    return {
+      sig: 'DRY_RUN_POOL_SWAP_' + Date.now(),
+      outAmount: swapQuote.outAmount,
+      priceImpactPct,
+    };
+  }
+
+  // 4. build + send tx
+  const swapTx = await dlmmPool.swap({
+    inToken: new PublicKey(inputMint),
+    outToken: new PublicKey(outputMint),
+    inAmount: amountInRaw,
+    minOutAmount: swapQuote.minOutAmount,
+    lbPair: dlmmPool.pubkey,
+    user: wallet.publicKey,
+    binArraysPubkey: swapQuote.binArraysPubkey,
   });
-  if (!swapRes.ok) throw new Error(`Jupiter swap ${swapRes.status}`);
-  const { swapTransaction } = await swapRes.json() as any;
 
-  const txBuf = Buffer.from(swapTransaction, 'base64');
-  const tx = VersionedTransaction.deserialize(txBuf);
-  tx.sign([wallet]);
-  const sig = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: false, maxRetries: 3 });
-  await connection.confirmTransaction({ signature: sig, blockhash: tx.message.recentBlockhash, lastValidBlockHeight: (await connection.getLatestBlockhash()).lastValidBlockHeight }, 'confirmed');
+  const sig = await sendTx(swapTx, [], 'pool_swap');
 
-  return { sig, outAmount };
+  return {
+    sig,
+    outAmount: swapQuote.outAmount,
+    priceImpactPct,
+  };
 }
 
 // ============================================================
@@ -952,36 +1220,36 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
       throw new Error(`两个 token 都不够: 缺 ${xShortfall.toFixed(4)} ${tokenSymbol(tokenXMint)} 和 ${yShortfall.toFixed(2)} ${tokenSymbol(tokenYMint)}`);
     }
 
-    // 哪个不够就从另一个 swap 一些过来,加 1% buffer 防滑点
+    // 哪个不够就从另一个 swap 一些过来,加 1.5% buffer 防滑点(单池滑点比 Jupiter 略高)
     if (xShortfall > 0) {
-      const xUsdNeeded = xShortfall * xPrice * 1.01;
+      const xUsdNeeded = xShortfall * xPrice * 1.015;
       const ySwapAmount = xUsdNeeded / yPrice;
       if (ySwapAmount > yUsable) {
         throw new Error(`${tokenSymbol(tokenYMint)} 不够 swap 补 ${tokenSymbol(tokenXMint)}: 需要 ${ySwapAmount.toFixed(2)},有 ${yUsable.toFixed(2)}`);
       }
       await notify(
-        `🔄 <b>资金路由</b>\n` +
+        `🔄 <b>资金路由(池内 swap)</b>\n` +
         `swap ${ySwapAmount.toFixed(2)} ${tokenSymbol(tokenYMint)} → ${tokenSymbol(tokenXMint)}\n` +
         `(缺 ${xShortfall.toFixed(4)} ${tokenSymbol(tokenXMint)})`
       );
       const swapAmountRaw = new BN(Math.floor(ySwapAmount * Math.pow(10, yDec)));
-      const { sig: swapSig } = await jupSwap(tokenYMint, tokenXMint, swapAmountRaw);
-      await notify(`✅ swap tx: <code>${swapSig}</code>`);
+      const { sig: swapSig, priceImpactPct } = await poolSwap(dlmmPool, tokenYMint, tokenXMint, swapAmountRaw);
+      await notify(`✅ swap tx: <code>${swapSig}</code> (滑点 ${priceImpactPct.toFixed(3)}%)`);
       await sleep(3000); // 等链上结算
     } else if (yShortfall > 0) {
-      const yUsdNeeded = yShortfall * yPrice * 1.01;
+      const yUsdNeeded = yShortfall * yPrice * 1.015;
       const xSwapAmount = yUsdNeeded / xPrice;
       if (xSwapAmount > xUsable) {
         throw new Error(`${tokenSymbol(tokenXMint)} 不够 swap 补 ${tokenSymbol(tokenYMint)}: 需要 ${xSwapAmount.toFixed(4)},有 ${xUsable.toFixed(4)}`);
       }
       await notify(
-        `🔄 <b>资金路由</b>\n` +
+        `🔄 <b>资金路由(池内 swap)</b>\n` +
         `swap ${xSwapAmount.toFixed(4)} ${tokenSymbol(tokenXMint)} → ${tokenSymbol(tokenYMint)}\n` +
         `(缺 ${yShortfall.toFixed(2)} ${tokenSymbol(tokenYMint)})`
       );
       const swapAmountRaw = new BN(Math.floor(xSwapAmount * Math.pow(10, xDec)));
-      const { sig: swapSig } = await jupSwap(tokenXMint, tokenYMint, swapAmountRaw);
-      await notify(`✅ swap tx: <code>${swapSig}</code>`);
+      const { sig: swapSig, priceImpactPct } = await poolSwap(dlmmPool, tokenXMint, tokenYMint, swapAmountRaw);
+      await notify(`✅ swap tx: <code>${swapSig}</code> (滑点 ${priceImpactPct.toFixed(3)}%)`);
       await sleep(3000);
     }
   }
@@ -1233,7 +1501,7 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
 }
 
 // 自动开仓 tick
-async function tickAutoOpen() {
+async function tickAutoOpen(verbose: boolean = false) {
   if (state.paused || !state.autoTrading) return;
 
   // 已有仓位数
@@ -1244,12 +1512,14 @@ async function tickAutoOpen() {
   // 4h 内已扫过就不重扫
   if (Date.now() - state.lastScanTs < CONFIG.SCAN_INTERVAL_MS) return;
 
-  await notify('🔍 扫描候选池...');
+  if (verbose) await notify('🔍 扫描候选池...');
+  console.log('[tickAutoOpen] 扫描候选池');
   const scored = await scanPools();
   const eligible = scored.filter(s => s.score > 0);
 
   if (eligible.length === 0) {
-    await notify('⚠️ 当前无符合条件的池子');
+    if (verbose) await notify('⚠️ 当前无符合条件的池子');
+    console.log('[tickAutoOpen] 无符合条件池子');
     return;
   }
 
@@ -1296,16 +1566,21 @@ async function tickAutoOpen() {
   }
 
   if (!chosen) {
-    await notify(
-      `⚠️ <b>无可开仓位</b>\n\n` +
-      `${eligible.length} 个池子通过硬筛,但全部跳过:\n` +
-      skipReasons.map(r => `• ${escHtml(r)}`).join('\n')
-    );
+    const msg = `⚠️ 无可开仓位\n${eligible.length} 个池子通过硬筛,但全部跳过:\n${skipReasons.map(r => `• ${r}`).join('\n')}`;
+    console.log(`[tickAutoOpen] ${msg.replace(/\n/g, ' | ')}`);
+    if (verbose) {
+      await notify(
+        `⚠️ <b>无可开仓位</b>\n\n` +
+        `${eligible.length} 个池子通过硬筛,但全部跳过:\n` +
+        skipReasons.map(r => `• ${escHtml(r)}`).join('\n')
+      );
+    }
     return;
   }
 
   const best = chosen;
-  if (skipReasons.length > 0) {
+  console.log(`[tickAutoOpen] 选中 ${best.info.pairName} bin_step ${best.info.binStep} score=${best.score.toFixed(1)}, skipped=${skipReasons.length}`);
+  if (verbose && skipReasons.length > 0) {
     await notify(`ℹ️ 跳过 ${skipReasons.length} 个池子,选 ${best.info.pairName} bin_step ${best.info.binStep} (score ${best.score.toFixed(1)})`);
   }
 
@@ -1318,8 +1593,9 @@ async function tickAutoOpen() {
   const poolHasSol = best.info.tokenXMint === SOL_MINT || best.info.tokenYMint === SOL_MINT;
   if (poolHasSol) {
     const maxByAvailableSol = wallet_.solUsd * 2 * 0.95; // 留 5% buffer 防 SOL 价格波动
+    console.log(`[tickAutoOpen] poolHasSol=true investUsd=${investUsd.toFixed(2)} solUsd=${wallet_.solUsd.toFixed(2)} maxBySol=${maxByAvailableSol.toFixed(2)}`);
     if (investUsd > maxByAvailableSol) {
-      console.log(`[tickAutoOpen] SOL-cap: ${fmtUsd(investUsd)} → ${fmtUsd(maxByAvailableSol)}`);
+      console.log(`[tickAutoOpen] SOL-cap triggered: ${fmtUsd(investUsd)} → ${fmtUsd(maxByAvailableSol)}`);
       investUsd = maxByAvailableSol;
     }
   }
@@ -1398,7 +1674,7 @@ bot.command('help', async (ctx) => {
     `/discover - 自动抓 Meteora top 池子加入候选\n` +
     `/addpool &lt;addr&gt; - 加候选池\n` +
     `/rmpool &lt;addr&gt; - 移除候选池\n\n` +
-    `<i>V0.1 Step 3</i>`,
+    `<i>V0.1.1</i>`,
     { parse_mode: 'HTML' }
   );
 });
@@ -1604,7 +1880,7 @@ bot.command('now', async (ctx) => {
   await ctx.reply('⏳ 立刻触发自动决策...');
   state.lastScanTs = 0;  // 强制重扫
   try {
-    await tickAutoOpen();
+    await tickAutoOpen(true);  // /now 是用户主动触发,verbose 通知所有过程
     await ctx.reply('✅ tickAutoOpen 完成,看上方的扫描结果或确认请求');
   } catch (e: any) {
     await ctx.reply(`❌ ${e.message}`);
@@ -1872,7 +2148,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.1 Step 3\n` +
+    `Version: V0.1.1\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n\n` +
