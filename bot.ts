@@ -69,7 +69,9 @@ const CONFIG = {
   PRIORITY_FEE_MICRO_LAMPORTS: 100_000,
   TX_MAX_RETRIES: 3,
   SWAP_SLIPPAGE_BPS: 100,                   // 池内 swap minOutAmount 滑点保护(1%)
-  SWAP_MAX_IMPACT_PCT: 3.0,                 // priceImpact 放弃执行门槛(超过则抛错,V2 改走 Jupiter)
+  SWAP_MAX_IMPACT_PCT: 3.0,                 // 池内 swap priceImpact 放弃门槛(超过则 fallback Jupiter)
+  PREFER_JUPITER: false,                    // true: 直接走 Jupiter; false: 先池内试探,失败再 fallback
+  JUPITER_SLIPPAGE_BPS: 100,                // Jupiter swap 滑点(1%)
 
   // API
   METEORA_API_HOSTS: [
@@ -1147,6 +1149,106 @@ async function poolSwap(
   };
 }
 
+/**
+ * Jupiter v6 swap (多池路由,适合池内流动性差时 fallback)
+ *
+ * 流程: quote → swap → 反序列化 VersionedTransaction → 钱包签名 → 发送 → 确认
+ */
+async function jupiterSwap(
+  inputMint: string,
+  outputMint: string,
+  amountInRaw: BN,
+): Promise<{ sig: string; outAmount: BN; priceImpactPct: number }> {
+  // 1. quote
+  const quoteUrl = `${CONFIG.JUP_API}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInRaw.toString()}&slippageBps=${CONFIG.JUPITER_SLIPPAGE_BPS}`;
+  const quoteRes = await fetch(quoteUrl, { signal: AbortSignal.timeout(8000) });
+  if (!quoteRes.ok) throw new Error(`jupiterSwap: quote ${quoteRes.status}`);
+  const quote: any = await quoteRes.json();
+  if (!quote.outAmount) throw new Error(`jupiterSwap: no route (${quote.error || 'unknown'})`);
+
+  const priceImpactPct = parseFloat(quote.priceImpactPct || '0') * 100;
+
+  if (CONFIG.DRY_RUN) {
+    console.log(`[DRY_RUN] would jupiterSwap ${amountInRaw.toString()} ${inputMint.slice(0, 8)} -> ${quote.outAmount} ${outputMint.slice(0, 8)} (impact ${priceImpactPct.toFixed(3)}%)`);
+    return {
+      sig: 'DRY_RUN_JUP_' + Date.now(),
+      outAmount: new BN(quote.outAmount),
+      priceImpactPct,
+    };
+  }
+
+  // 2. build swap tx
+  const swapRes = await fetch(`${CONFIG.JUP_API}/swap`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      quoteResponse: quote,
+      userPublicKey: wallet.publicKey.toBase58(),
+      wrapAndUnwrapSol: true,
+      computeUnitPriceMicroLamports: CONFIG.PRIORITY_FEE_MICRO_LAMPORTS,
+      dynamicComputeUnitLimit: true,
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!swapRes.ok) {
+    const errText = await swapRes.text();
+    throw new Error(`jupiterSwap: build tx ${swapRes.status}: ${errText.slice(0, 200)}`);
+  }
+  const swapJson: any = await swapRes.json();
+  if (!swapJson.swapTransaction) throw new Error('jupiterSwap: no swapTransaction in response');
+
+  // 3. deserialize + sign + send
+  const txBuf = Buffer.from(swapJson.swapTransaction, 'base64');
+  const tx = VersionedTransaction.deserialize(txBuf);
+  tx.sign([wallet]);
+
+  const sig = await connection.sendRawTransaction(tx.serialize(), {
+    skipPreflight: false,
+    maxRetries: CONFIG.TX_MAX_RETRIES,
+  });
+
+  // 4. confirm
+  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+  await connection.confirmTransaction({
+    signature: sig,
+    blockhash,
+    lastValidBlockHeight,
+  }, 'confirmed');
+
+  return {
+    sig,
+    outAmount: new BN(quote.outAmount),
+    priceImpactPct,
+  };
+}
+
+/**
+ * 智能 swap 路由 (本项目核心 — meteora-router 的 router):
+ * - PREFER_JUPITER=false (默认): 先试 poolSwap (单池便宜 + 快),失败回退 Jupiter
+ * - PREFER_JUPITER=true: 直接走 Jupiter (极端波动期可临时切换)
+ *
+ * 失败 fallback 触发条件: 滑点过大 / no binArrays / no route / 任何 RPC 错误
+ */
+async function swapTokens(
+  dlmmPool: any,
+  inputMint: string,
+  outputMint: string,
+  amountInRaw: BN,
+): Promise<{ sig: string; outAmount: BN; priceImpactPct: number; route: 'pool' | 'jupiter' }> {
+  if (!CONFIG.PREFER_JUPITER) {
+    try {
+      const r = await poolSwap(dlmmPool, inputMint, outputMint, amountInRaw);
+      return { ...r, route: 'pool' };
+    } catch (e: any) {
+      console.log(`[swapTokens] poolSwap failed (${e.message}) → fallback Jupiter`);
+      // 继续走 Jupiter
+    }
+  }
+
+  const r = await jupiterSwap(inputMint, outputMint, amountInRaw);
+  return { ...r, route: 'jupiter' };
+}
+
 // ============================================================
 // 12. DLMM 操作层
 // ============================================================
@@ -1231,13 +1333,13 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
         throw new Error(`${tokenSymbol(tokenYMint)} 不够 swap 补 ${tokenSymbol(tokenXMint)}: 需要 ${ySwapAmount.toFixed(2)},有 ${yUsable.toFixed(2)}`);
       }
       await notify(
-        `🔄 <b>资金路由(池内 swap)</b>\n` +
+        `🔄 <b>资金路由</b>\n` +
         `swap ${ySwapAmount.toFixed(2)} ${tokenSymbol(tokenYMint)} → ${tokenSymbol(tokenXMint)}\n` +
         `(缺 ${xShortfall.toFixed(4)} ${tokenSymbol(tokenXMint)})`
       );
       const swapAmountRaw = new BN(Math.floor(ySwapAmount * Math.pow(10, yDec)));
-      const { sig: swapSig, priceImpactPct } = await poolSwap(dlmmPool, tokenYMint, tokenXMint, swapAmountRaw);
-      await notify(`✅ swap tx: <code>${swapSig}</code> (滑点 ${priceImpactPct.toFixed(3)}%)`);
+      const { sig: swapSig, priceImpactPct, route } = await swapTokens(dlmmPool, tokenYMint, tokenXMint, swapAmountRaw);
+      await notify(`✅ swap tx [${route}]: <code>${swapSig}</code> (滑点 ${priceImpactPct.toFixed(3)}%)`);
       await sleep(3000); // 等链上结算
     } else if (yShortfall > 0) {
       const yUsdNeeded = yShortfall * yPrice * 1.015;
@@ -1246,13 +1348,13 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
         throw new Error(`${tokenSymbol(tokenXMint)} 不够 swap 补 ${tokenSymbol(tokenYMint)}: 需要 ${xSwapAmount.toFixed(4)},有 ${xUsable.toFixed(4)}`);
       }
       await notify(
-        `🔄 <b>资金路由(池内 swap)</b>\n` +
+        `🔄 <b>资金路由</b>\n` +
         `swap ${xSwapAmount.toFixed(4)} ${tokenSymbol(tokenXMint)} → ${tokenSymbol(tokenYMint)}\n` +
         `(缺 ${yShortfall.toFixed(2)} ${tokenSymbol(tokenYMint)})`
       );
       const swapAmountRaw = new BN(Math.floor(xSwapAmount * Math.pow(10, xDec)));
-      const { sig: swapSig, priceImpactPct } = await poolSwap(dlmmPool, tokenXMint, tokenYMint, swapAmountRaw);
-      await notify(`✅ swap tx: <code>${swapSig}</code> (滑点 ${priceImpactPct.toFixed(3)}%)`);
+      const { sig: swapSig, priceImpactPct, route } = await swapTokens(dlmmPool, tokenXMint, tokenYMint, swapAmountRaw);
+      await notify(`✅ swap tx [${route}]: <code>${swapSig}</code> (滑点 ${priceImpactPct.toFixed(3)}%)`);
       await sleep(3000);
     }
   }
