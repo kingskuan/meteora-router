@@ -73,6 +73,12 @@ const CONFIG = {
   PREFER_JUPITER: false,                    // true: 直接走 Jupiter; false: 先池内试探,失败再 fallback
   JUPITER_SLIPPAGE_BPS: 100,                // Jupiter swap 滑点(1%)
 
+  // V2 健壮性
+  MIN_REBALANCE_USD: 10,                    // rebalance 重建下限(低于此值放弃,避免 dust 仓位)
+  MAX_REBALANCE_FAILS: 3,                   // 同 pair 连续 rebalance 失败上限,超过才 paused
+  LOW_GAS_THRESHOLD_SOL: 0.05,              // SOL 余额低于此值发预警(0.05 SOL ≈ 几十笔 gas)
+  GAS_CHECK_EVERY_N_LOOPS: 4,               // 每 N 个 loop 检查一次 SOL 余额(约 2 分钟)
+
   // API
   METEORA_API_HOSTS: [
     'https://dlmm.datapi.meteora.ag',
@@ -1054,18 +1060,37 @@ async function sendTx(
     return 'DRY_RUN_' + Date.now();
   }
   withPriorityFee(tx);
-  const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
-  tx.recentBlockhash = blockhash;
-  tx.lastValidBlockHeight = lastValidBlockHeight;
-  tx.feePayer = wallet.publicKey;
 
-  const sig = await sendAndConfirmTransaction(
-    connection,
-    tx,
-    [wallet, ...extraSigners],
-    { commitment: 'confirmed', skipPreflight: false, maxRetries: CONFIG.TX_MAX_RETRIES }
-  );
-  return sig;
+  // V2: 外层重试,处理 blockhash 过期 / RPC 抖动 / 网络瞬时错误
+  // sendAndConfirmTransaction 内部 maxRetries 是 RPC 发送层的,不能重新拿 blockhash;
+  // 这里 outer loop 每次重新拿 blockhash 并重签
+  let lastErr: any;
+  for (let attempt = 1; attempt <= CONFIG.TX_MAX_RETRIES; attempt++) {
+    try {
+      const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+      tx.recentBlockhash = blockhash;
+      tx.lastValidBlockHeight = lastValidBlockHeight;
+      tx.feePayer = wallet.publicKey;
+
+      const sig = await sendAndConfirmTransaction(
+        connection,
+        tx,
+        [wallet, ...extraSigners],
+        { commitment: 'confirmed', skipPreflight: false, maxRetries: 0 }
+      );
+      if (attempt > 1) console.log(`[sendTx ${label}] succeeded on attempt ${attempt}`);
+      return sig;
+    } catch (e: any) {
+      lastErr = e;
+      const msg = e?.message || String(e);
+      // 可重试错误: blockhash 过期 / 网络抖动 / 429 / 503 / timeout
+      const retryable = /blockhash|expired|fetch failed|429|503|timeout|ECONNRESET|ETIMEDOUT/i.test(msg);
+      if (!retryable || attempt === CONFIG.TX_MAX_RETRIES) break;
+      console.log(`[sendTx ${label}] retryable error (attempt ${attempt}/${CONFIG.TX_MAX_RETRIES}): ${msg.slice(0, 120)}`);
+      await sleep(1500 * attempt); // 指数退避: 1.5s → 3s → 4.5s
+    }
+  }
+  throw lastErr;
 }
 
 // ============================================================
@@ -1514,6 +1539,9 @@ function isInRebalanceCooldown(lbPair: string): boolean {
   return last !== undefined && (Date.now() - last) < CONFIG.REBALANCE_COOLDOWN_MS;
 }
 
+// V2: rebalance 失败计数(key: lbPair) — 连续失败 ≥ MAX_REBALANCE_FAILS 才 paused,而非单次失败就停
+const rebalanceFailCount = new Map<string, number>();
+
 async function tickPositions() {
   const positions = await getUserPositions();
 
@@ -1611,22 +1639,90 @@ async function tickPositions() {
 }
 
 /**
- * 重建仓位:close → 重新选 range 在当前 active bin 周围 → open
+ * 重建仓位 (V2):
+ * - close → 读关仓后实际钱包余额 → 折算 USD → 用实际值开仓 (而非原始 originalValueUsd)
+ * - 报告 IL: 实际值 vs 原始值
+ * - 失败不立即 paused: 累计 ≥ MAX_REBALANCE_FAILS 才 paused
  */
 async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
+  const lbPair = p.lbPair;
   await notify(`🔄 <b>Rebalance ${p.pairName}</b>`);
   try {
     await closePosition(p.positionPk, 'rebalance');
-    // 等链上结算
-    await sleep(3000);
+    await sleep(3000); // 等链上结算
 
-    // 用关仓后的资金估算可重建金额
-    // 简化:用原始 value 重建(假设 IL 不大)
-    const reopenAmount = Math.min(originalValueUsd, CONFIG.MAX_POSITION_USD);
-    await openPosition(p.lbPair, reopenAmount);
+    // ============ V2: 用关仓后实际余额估算重建金额 ============
+    const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
+    const xMint = dlmmPool.tokenX.publicKey.toBase58();
+    const yMint = dlmmPool.tokenY.publicKey.toBase58();
+    const xDec =
+      (dlmmPool.tokenX as any)?.mint?.decimals ??
+      (dlmmPool.tokenX as any)?.decimal ??
+      KNOWN_TOKENS[xMint]?.decimals ?? 9;
+    const yDec =
+      (dlmmPool.tokenY as any)?.mint?.decimals ??
+      (dlmmPool.tokenY as any)?.decimal ??
+      KNOWN_TOKENS[yMint]?.decimals ?? 6;
+
+    // 读钱包余额(SOL 走原生 lamports,SPL 走 ATA)
+    const xBal = xMint === SOL_MINT
+      ? (await connection.getBalance(wallet.publicKey)) / 1e9
+      : await getSplBalance(xMint, xDec);
+    const yBal = yMint === SOL_MINT
+      ? (await connection.getBalance(wallet.publicKey)) / 1e9
+      : await getSplBalance(yMint, yDec);
+
+    // SOL 留 0.1 给 gas/rent (跟 openPosition 一致)
+    const xUsable = xMint === SOL_MINT ? Math.max(0, xBal - 0.1) : xBal;
+    const yUsable = yMint === SOL_MINT ? Math.max(0, yBal - 0.1) : yBal;
+
+    const xPrice = await getTokenPriceUsd(xMint);
+    const yPrice = await getTokenPriceUsd(yMint);
+    const actualUsd = xUsable * xPrice + yUsable * yPrice;
+
+    // 安全边界:
+    // - 上限: min(原始值 × 1.1, MAX_POSITION_USD) — 防止吞噬钱包其他来源资金
+    // - 下限: MIN_REBALANCE_USD — 太小没意义,gas 都赚不回
+    const upperBound = Math.min(originalValueUsd * 1.1, CONFIG.MAX_POSITION_USD);
+    const reopenAmount = Math.min(actualUsd, upperBound);
+
+    if (reopenAmount < CONFIG.MIN_REBALANCE_USD) {
+      throw new Error(
+        `重建金额 ${fmtUsd(reopenAmount)} < 最小阈值 ${fmtUsd(CONFIG.MIN_REBALANCE_USD)} (实际余额 ${fmtUsd(actualUsd)})`
+      );
+    }
+
+    // IL 报告
+    const ilDiff = actualUsd - originalValueUsd;
+    const ilPct = originalValueUsd > 0 ? (ilDiff / originalValueUsd) * 100 : 0;
+    await notify(
+      `📊 <b>关仓后实际余额</b>: ${fmtUsd(actualUsd)}\n` +
+      `(原 ${fmtUsd(originalValueUsd)}, IL ${ilPct >= 0 ? '+' : ''}${ilPct.toFixed(2)}%)\n` +
+      `重建金额: ${fmtUsd(reopenAmount)}`
+    );
+
+    await openPosition(lbPair, reopenAmount);
+
+    // 成功 → 清失败计数
+    rebalanceFailCount.delete(lbPair);
   } catch (e: any) {
-    await notify(`❌ Rebalance 失败: ${e.message}\n暂停 bot`);
-    state.paused = true;
+    // V2: 失败计数,达到上限才 paused (允许瞬时 RPC 错误自动重试)
+    const fails = (rebalanceFailCount.get(lbPair) || 0) + 1;
+    rebalanceFailCount.set(lbPair, fails);
+    if (fails >= CONFIG.MAX_REBALANCE_FAILS) {
+      await notify(
+        `❌ <b>Rebalance 连续失败 ${fails} 次</b>: ${e.message}\n` +
+        `已暂停 bot,需手动 /resume`
+      );
+      state.paused = true;
+      rebalanceFailCount.delete(lbPair); // 重置,避免恢复后再次秒爆
+    } else {
+      await notify(
+        `⚠️ Rebalance 失败 ${fails}/${CONFIG.MAX_REBALANCE_FAILS}: ${e.message}\n` +
+        `不暂停 bot,${CONFIG.REBALANCE_COOLDOWN_MS / 60000} 分钟 cooldown 后下个 tick 自动重试`
+      );
+      // 不 paused, 等 cooldown 过后自然重试
+    }
   }
 }
 
@@ -2228,6 +2324,32 @@ app.listen(CONFIG.PORT, () => console.log(`🩺 :${CONFIG.PORT}/health`));
 // 16. 主循环
 // ============================================================
 
+// V2: SOL gas 余额预警状态(防刷屏 — 发过一次后不再发,等余额回升 50% 以上才重置)
+let lowGasWarned = false;
+
+async function checkLowGasAndAlert(): Promise<void> {
+  try {
+    const lamports = await connection.getBalance(wallet.publicKey);
+    const sol = lamports / 1e9;
+    if (sol < CONFIG.LOW_GAS_THRESHOLD_SOL && !lowGasWarned) {
+      const solPrice = await getTokenPriceUsd(SOL_MINT).catch(() => 0);
+      await notify(
+        `⛽ <b>SOL gas 余额预警</b>\n` +
+        `当前: ${sol.toFixed(4)} SOL${solPrice ? ` (≈ ${fmtUsd(sol * solPrice)})` : ''}\n` +
+        `阈值: ${CONFIG.LOW_GAS_THRESHOLD_SOL} SOL\n` +
+        `请尽快充值,否则后续交易会因 gas 不足失败`
+      );
+      lowGasWarned = true;
+    } else if (sol >= CONFIG.LOW_GAS_THRESHOLD_SOL * 1.5 && lowGasWarned) {
+      // 余额回升 50% 以上才清除标志(避免阈值附近震荡反复发预警)
+      lowGasWarned = false;
+      console.log(`[gas] balance recovered to ${sol.toFixed(4)} SOL, alert cleared`);
+    }
+  } catch (e: any) {
+    console.error(`checkLowGasAndAlert error: ${e.message}`);
+  }
+}
+
 let tickCounter = 0;
 
 async function mainLoop() {
@@ -2239,6 +2361,10 @@ async function mainLoop() {
       // tickAutoOpen 每 N 个 loop 跑一次
       if (tickCounter % CONFIG.AUTO_TICK_EVERY_N_LOOPS === 0) {
         await tickAutoOpen();
+      }
+      // V2: SOL gas 预警 — 每 N 个 loop 检查一次(默认 2 分钟)
+      if (tickCounter % CONFIG.GAS_CHECK_EVERY_N_LOOPS === 0) {
+        await checkLowGasAndAlert();
       }
     } catch (e: any) {
       console.error(`[loop] error: ${e.message}`);
@@ -2278,7 +2404,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.1.1\n` +
+    `Version: V0.6 (rebalance hardening + jupiter router)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n\n` +

@@ -1,7 +1,7 @@
 {
   "name": "meteora-router",
-  "version": "0.4.0",
-  "description": "Meteora DLMM auto rebalance bot - V0.1.1 (onchain swap + onchain fee)",
+  "version": "0.6.0",
+  "description": "Meteora DLMM auto rebalance bot - V0.6 (jupiter router fallback + rebalance hardening)",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc",
