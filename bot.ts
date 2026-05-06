@@ -1814,17 +1814,20 @@ async function tickAutoOpen(verbose: boolean = false) {
   const wallet_ = await getWalletSnapshot();
   let investUsd = Math.min(wallet_.totalUsableUsd * 0.4, CONFIG.MAX_POSITION_USD);
 
-  // 如果池子涉及 SOL,投资金额还要被 SOL 可用量限制
-  // (因为 50/50 仓位需要的 SOL 不能超过可用 SOL)
+  // V2.1: 不再用 SOL 余额硬限制 investUsd
+  // (B 版加 Jupiter router 后,USDC/USDT 可自动 swap 成 SOL 补缺口)
+  // 但仍然预览即将发生的 swap,让用户知情
   const poolHasSol = best.info.tokenXMint === SOL_MINT || best.info.tokenYMint === SOL_MINT;
+  let swapPreviewMsg = '';
   if (poolHasSol) {
-    const maxByAvailableSol = wallet_.solUsd * 2 * 0.95; // 留 5% buffer 防 SOL 价格波动
-    console.log(`[tickAutoOpen] poolHasSol=true investUsd=${investUsd.toFixed(2)} solUsd=${wallet_.solUsd.toFixed(2)} maxBySol=${maxByAvailableSol.toFixed(2)}`);
-    if (investUsd > maxByAvailableSol) {
-      console.log(`[tickAutoOpen] SOL-cap triggered: ${fmtUsd(investUsd)} → ${fmtUsd(maxByAvailableSol)}`);
-      investUsd = maxByAvailableSol;
+    const solNeededUsd = investUsd / 2; // 50/50 仓位 SOL 端需要的金额
+    if (solNeededUsd > wallet_.solUsd) {
+      const swapShortfallUsd = solNeededUsd - wallet_.solUsd;
+      swapPreviewMsg = `\n💱 预计需 swap ~${fmtUsd(swapShortfallUsd)} USDC/USDT → SOL`;
+      console.log(`[tickAutoOpen] swap preview: need ${fmtUsd(swapShortfallUsd)} more SOL for 50/50`);
     }
   }
+  console.log(`[tickAutoOpen] investUsd=${investUsd.toFixed(2)} totalUsable=${wallet_.totalUsableUsd.toFixed(2)} solUsd=${wallet_.solUsd.toFixed(2)}`);
 
   if (investUsd < 5) {
     await notify(
@@ -1852,7 +1855,7 @@ async function tickAutoOpen(verbose: boolean = false) {
       `池子: ${best.info.pairName}\n` +
       `分数: ${best.score.toFixed(1)}\n` +
       `Fee APR: ${fmtPct(best.info.feeApr)}\n` +
-      `投入: ${fmtUsd(investUsd)}\n\n` +
+      `投入: ${fmtUsd(investUsd)}${swapPreviewMsg}\n\n` +
       `回复 <code>/confirm</code> 确认开仓\n` +
       `回复 <code>/cancel</code> 取消\n` +
       `5 分钟内有效`
@@ -2404,7 +2407,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.6 (rebalance hardening + jupiter router)\n` +
+    `Version: V0.6.1 (rebalance hardening + jupiter router + SOL-cap removed)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n\n` +

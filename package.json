@@ -1,7 +1,7 @@
 {
   "name": "meteora-router",
-  "version": "0.6.0",
-  "description": "Meteora DLMM auto rebalance bot - V0.6 (jupiter router fallback + rebalance hardening)",
+  "version": "0.6.1",
+  "description": "Meteora DLMM auto rebalance bot - V0.6.1 (remove obsolete SOL-cap, router补缺口)",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc",
