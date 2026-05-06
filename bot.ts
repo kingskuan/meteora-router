@@ -68,7 +68,8 @@ const CONFIG = {
   // Tx
   PRIORITY_FEE_MICRO_LAMPORTS: 100_000,
   TX_MAX_RETRIES: 3,
-  SWAP_SLIPPAGE_BPS: 50,
+  SWAP_SLIPPAGE_BPS: 100,                   // 池内 swap minOutAmount 滑点保护(1%)
+  SWAP_MAX_IMPACT_PCT: 3.0,                 // priceImpact 放弃执行门槛(超过则抛错,V2 改走 Jupiter)
 
   // API
   METEORA_API_HOSTS: [
@@ -1113,8 +1114,8 @@ async function poolSwap(
 
   // 3. 滑点检查(SwapQuote.priceImpact 是 Decimal)
   const priceImpactPct = parseFloat(swapQuote.priceImpact.toFixed(4)) * 100;
-  if (priceImpactPct > 1.5) {
-    throw new Error(`poolSwap: 滑点过大 ${priceImpactPct.toFixed(2)}% > 1.5%`);
+  if (priceImpactPct > CONFIG.SWAP_MAX_IMPACT_PCT) {
+    throw new Error(`poolSwap: 滑点过大 ${priceImpactPct.toFixed(2)}% > ${CONFIG.SWAP_MAX_IMPACT_PCT}%`);
   }
 
   if (CONFIG.DRY_RUN) {
