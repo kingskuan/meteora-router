@@ -56,7 +56,9 @@ const CONFIG = {
 
   // 策略默认
   RANGE_PCT: 10,
-  REBALANCE_THRESHOLD: 0.45,
+  REBALANCE_THRESHOLD: 0.45,                // 漂移触发阈值(保留作为兜底)
+  REBALANCE_COOLDOWN_MS: 5 * 60_000,        // rebalance 后 5 分钟内同 pair 不再触发(防抖)
+  SINGLE_SIDED_DUST_TOKEN: 1e-3,            // 某 token amount 低于此值 → 视为 100% single-sided
   CLAIM_THRESHOLD_PCT: 1.0,
   CHECK_INTERVAL_MS: 30_000,
   SCAN_INTERVAL_MS: 30 * 60_000,     // 30min (V0.1 开发期紧凑值,V0.2 生产期可调到 4h)
@@ -1402,6 +1404,13 @@ async function claimFees(positionPk: string): Promise<string> {
 // 13. 风控 / 巡检
 // ============================================================
 
+// rebalance 冷却记录(key: lbPair) — 防止 paused 刷屏 + 防止价格在边界来回穿造成反复 rebalance
+const lastRebalanceAt = new Map<string, number>();
+function isInRebalanceCooldown(lbPair: string): boolean {
+  const last = lastRebalanceAt.get(lbPair);
+  return last !== undefined && (Date.now() - last) < CONFIG.REBALANCE_COOLDOWN_MS;
+}
+
 async function tickPositions() {
   const positions = await getUserPositions();
 
@@ -1436,18 +1445,36 @@ async function tickPositions() {
         continue;
       }
 
-      // 2. 出 range / 漂移 检查
+      // 2. 出 range / 漂移 检查 (双触发: single-sided 或 drift 阈值)
       if (!p.inRange) {
+        // 冷却期内跳过(防刷屏 / 防边界震荡)
+        if (isInRebalanceCooldown(p.lbPair)) continue;
+
         const distance = p.activeBinId < p.minBinId
           ? (p.minBinId - p.activeBinId)
           : (p.activeBinId - p.maxBinId);
         const halfSpan = (p.maxBinId - p.minBinId) / 2;
-        if (halfSpan > 0 && distance / halfSpan > CONFIG.REBALANCE_THRESHOLD) {
+        const driftRatio = halfSpan > 0 ? distance / halfSpan : 0;
+
+        // single-sided 判定: 某一端 token 已被全部 swap 走 → 仓位停止赚费,必须立即调仓
+        const dust = CONFIG.SINGLE_SIDED_DUST_TOKEN;
+        const isSingleSided = p.totalXAmountFloat < dust || p.totalYAmountFloat < dust;
+
+        const triggerReason = isSingleSided
+          ? `100% single-sided (${p.tokenXSymbol}=${p.totalXAmountFloat.toFixed(6)} ${p.tokenYSymbol}=${p.totalYAmountFloat.toFixed(4)})`
+          : (driftRatio > CONFIG.REBALANCE_THRESHOLD
+              ? `drift ${(driftRatio * 100).toFixed(1)}% > ${(CONFIG.REBALANCE_THRESHOLD * 100).toFixed(0)}%`
+              : null);
+
+        if (triggerReason) {
           await notify(
             `⚠️ <b>${p.pairName} 已出 range</b>\n` +
             `active bin ${p.activeBinId},仓位 ${p.minBinId}~${p.maxBinId}\n` +
+            `触发: ${triggerReason}\n` +
             `${state.paused ? 'paused, 不触发 rebalance' : '准备 rebalance'}`
           );
+          // 不论是否 paused 都打冷却戳,paused 状态也避免 30 秒一次刷屏
+          lastRebalanceAt.set(p.lbPair, Date.now());
           if (!state.paused) {
             await rebalancePosition(p, openValueUsd);
             continue;
