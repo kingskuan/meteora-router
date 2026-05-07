@@ -120,6 +120,7 @@ interface RuntimeState {
   paused: boolean;          // /pause 状态
   autoTrading: boolean;     // 自动开仓开关
   firstOpenConfirmed: boolean; // 首次开仓二次确认状态
+  rebalancing: boolean;     // V2.3: rebalance 进行中(防 tickAutoOpen 并发触发开仓)
   pendingConfirmation: null | {
     type: 'open';
     lbPair: string;
@@ -134,6 +135,7 @@ const state: RuntimeState = {
   paused: false,
   autoTrading: false,
   firstOpenConfirmed: false,
+  rebalancing: false,
   pendingConfirmation: null,
   lastScanTs: 0,
   candidatePools: [...CANDIDATE_POOLS_DEFAULT],
@@ -1639,19 +1641,42 @@ async function tickPositions() {
 }
 
 /**
- * 重建仓位 (V2):
- * - close → 读关仓后实际钱包余额 → 折算 USD → 用实际值开仓 (而非原始 originalValueUsd)
- * - 报告 IL: 实际值 vs 原始值
+ * V2.3: 钱包指定 mint pair 的 USD 快照(用于 rebalance 前后比对)
+ * 注意:这里不扣 gas reserve,因为我们要的是真实余额变化
+ */
+async function snapshotPairUsd(
+  xMint: string,
+  yMint: string,
+  xDec: number,
+  yDec: number,
+): Promise<number> {
+  const xBal = xMint === SOL_MINT
+    ? (await connection.getBalance(wallet.publicKey)) / 1e9
+    : await getSplBalance(xMint, xDec);
+  const yBal = yMint === SOL_MINT
+    ? (await connection.getBalance(wallet.publicKey)) / 1e9
+    : await getSplBalance(yMint, yDec);
+  const xPrice = await getTokenPriceUsd(xMint);
+  const yPrice = await getTokenPriceUsd(yMint);
+  return xBal * xPrice + yBal * yPrice;
+}
+
+/**
+ * 重建仓位 (V2.3):
+ * - close 前后快照钱包余额,差值 = 这次仓位真正解出的钱(自动包含 fee + IL)
+ * - 报告真 IL: 仓位实际解出 vs 原始投入
  * - 失败不立即 paused: 累计 ≥ MAX_REBALANCE_FAILS 才 paused
+ * - 全程持有 state.rebalancing=true,防 tickAutoOpen 并发开仓
  */
 async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
   const lbPair = p.lbPair;
-  await notify(`🔄 <b>Rebalance ${p.pairName}</b>`);
-  try {
-    await closePosition(p.positionPk, 'rebalance');
-    await sleep(3000); // 等链上结算
 
-    // ============ V2: 用关仓后实际余额估算重建金额 ============
+  // V2.3: rebalance 进行中,tickAutoOpen 跳过(防双开)
+  state.rebalancing = true;
+  await notify(`🔄 <b>Rebalance ${p.pairName}</b>`);
+
+  try {
+    // 池子 token 信息(用于钱包快照)
     const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
     const xMint = dlmmPool.tokenX.publicKey.toBase58();
     const yMint = dlmmPool.tokenY.publicKey.toBase58();
@@ -1664,21 +1689,23 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
       (dlmmPool.tokenY as any)?.decimal ??
       KNOWN_TOKENS[yMint]?.decimals ?? 6;
 
-    // 读钱包余额(SOL 走原生 lamports,SPL 走 ATA)
-    const xBal = xMint === SOL_MINT
-      ? (await connection.getBalance(wallet.publicKey)) / 1e9
-      : await getSplBalance(xMint, xDec);
-    const yBal = yMint === SOL_MINT
-      ? (await connection.getBalance(wallet.publicKey)) / 1e9
-      : await getSplBalance(yMint, yDec);
+    // ============ V2.3 关键修复: 关仓前后快照差值 ============
+    const beforeUsd = await snapshotPairUsd(xMint, yMint, xDec, yDec);
+    console.log(`[rebalance] before close: wallet ${tokenSymbol(xMint)}+${tokenSymbol(yMint)} = ${fmtUsd(beforeUsd)}`);
 
-    // SOL 留 0.1 给 gas/rent (跟 openPosition 一致)
-    const xUsable = xMint === SOL_MINT ? Math.max(0, xBal - 0.1) : xBal;
-    const yUsable = yMint === SOL_MINT ? Math.max(0, yBal - 0.1) : yBal;
+    await closePosition(p.positionPk, 'rebalance');
+    await sleep(3000); // 等链上结算
 
-    const xPrice = await getTokenPriceUsd(xMint);
-    const yPrice = await getTokenPriceUsd(yMint);
-    const actualUsd = xUsable * xPrice + yUsable * yPrice;
+    const afterUsd = await snapshotPairUsd(xMint, yMint, xDec, yDec);
+    console.log(`[rebalance] after close: wallet ${tokenSymbol(xMint)}+${tokenSymbol(yMint)} = ${fmtUsd(afterUsd)}`);
+
+    // 差值 = 这次仓位真正解出的钱
+    const positionRecoveredUsd = afterUsd - beforeUsd;
+    // 兜底: 若差值异常(负数/接近 0,说明价格剧变或快照失败),回退用原始值
+    const actualUsd = positionRecoveredUsd > 0.5 ? positionRecoveredUsd : originalValueUsd;
+    if (positionRecoveredUsd <= 0.5) {
+      console.warn(`[rebalance] WARNING: 快照差值异常 ${fmtUsd(positionRecoveredUsd)}, 回退使用 originalValueUsd=${fmtUsd(originalValueUsd)}`);
+    }
 
     // 安全边界:
     // - 上限: min(原始值 × 1.1, MAX_POSITION_USD) — 防止吞噬钱包其他来源资金
@@ -1688,15 +1715,15 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
 
     if (reopenAmount < CONFIG.MIN_REBALANCE_USD) {
       throw new Error(
-        `重建金额 ${fmtUsd(reopenAmount)} < 最小阈值 ${fmtUsd(CONFIG.MIN_REBALANCE_USD)} (实际余额 ${fmtUsd(actualUsd)})`
+        `重建金额 ${fmtUsd(reopenAmount)} < 最小阈值 ${fmtUsd(CONFIG.MIN_REBALANCE_USD)} (仓位解出 ${fmtUsd(actualUsd)})`
       );
     }
 
-    // IL 报告
+    // IL 报告(基于真实仓位差值)
     const ilDiff = actualUsd - originalValueUsd;
     const ilPct = originalValueUsd > 0 ? (ilDiff / originalValueUsd) * 100 : 0;
     await notify(
-      `📊 <b>关仓后实际余额</b>: ${fmtUsd(actualUsd)}\n` +
+      `📊 <b>仓位实际解出</b>: ${fmtUsd(actualUsd)}\n` +
       `(原 ${fmtUsd(originalValueUsd)}, IL ${ilPct >= 0 ? '+' : ''}${ilPct.toFixed(2)}%)\n` +
       `重建金额: ${fmtUsd(reopenAmount)}`
     );
@@ -1723,12 +1750,21 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
       );
       // 不 paused, 等 cooldown 过后自然重试
     }
+  } finally {
+    // V2.3: 无论成功失败都释放标志位
+    state.rebalancing = false;
   }
 }
 
 // 自动开仓 tick
 async function tickAutoOpen(verbose: boolean = false) {
   if (state.paused || !state.autoTrading) return;
+
+  // V2.3: rebalance 进行中,跳过(防双开 — close 后短暂"无仓"的窗口期可能误触发首次确认)
+  if (state.rebalancing) {
+    console.log('[tickAutoOpen] skip: rebalance in progress');
+    return;
+  }
 
   // 已有仓位数
   const r = await db.query<{ c: string }>(`SELECT COUNT(*) as c FROM positions WHERE status='open'`);
@@ -2407,7 +2443,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.6.2 (jupiter fetch retry)\n` +
+    `Version: V0.6.3 (snapshot-diff IL + rebalancing flag + jupiter retry)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n\n` +
