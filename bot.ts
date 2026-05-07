@@ -1184,9 +1184,9 @@ async function jupiterSwap(
   outputMint: string,
   amountInRaw: BN,
 ): Promise<{ sig: string; outAmount: BN; priceImpactPct: number }> {
-  // 1. quote
+  // 1. quote (V2.2: retry 3次,Jupiter API 偶发抖动免疫)
   const quoteUrl = `${CONFIG.JUP_API}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountInRaw.toString()}&slippageBps=${CONFIG.JUPITER_SLIPPAGE_BPS}`;
-  const quoteRes = await fetch(quoteUrl, { signal: AbortSignal.timeout(8000) });
+  const quoteRes = await retry(() => fetch(quoteUrl, { signal: AbortSignal.timeout(8000) }), 3, 1500);
   if (!quoteRes.ok) throw new Error(`jupiterSwap: quote ${quoteRes.status}`);
   const quote: any = await quoteRes.json();
   if (!quote.outAmount) throw new Error(`jupiterSwap: no route (${quote.error || 'unknown'})`);
@@ -1202,8 +1202,8 @@ async function jupiterSwap(
     };
   }
 
-  // 2. build swap tx
-  const swapRes = await fetch(`${CONFIG.JUP_API}/swap`, {
+  // 2. build swap tx (V2.2: retry 3次)
+  const swapRes = await retry(() => fetch(`${CONFIG.JUP_API}/swap`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1214,7 +1214,7 @@ async function jupiterSwap(
       dynamicComputeUnitLimit: true,
     }),
     signal: AbortSignal.timeout(15000),
-  });
+  }), 3, 1500);
   if (!swapRes.ok) {
     const errText = await swapRes.text();
     throw new Error(`jupiterSwap: build tx ${swapRes.status}: ${errText.slice(0, 200)}`);
@@ -2407,7 +2407,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.6.1 (rebalance hardening + jupiter router + SOL-cap removed)\n` +
+    `Version: V0.6.2 (jupiter fetch retry)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n\n` +
