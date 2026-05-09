@@ -59,7 +59,7 @@ const CONFIG = {
   REBALANCE_THRESHOLD: 0.45,                // 漂移触发阈值(保留作为兜底)
   REBALANCE_COOLDOWN_MS: 5 * 60_000,        // rebalance 后 5 分钟内同 pair 不再触发(防抖)
   SINGLE_SIDED_DUST_TOKEN: 1e-3,            // 某 token amount 低于此值 → 视为 100% single-sided
-  CLAIM_THRESHOLD_PCT: 1.0,
+  // CLAIM_THRESHOLD_PCT 已废弃 (V0.8 Zip 1) — 现在统一走 #3 自动 Claim Agent
   CHECK_INTERVAL_MS: 30_000,
   SCAN_INTERVAL_MS: 30 * 60_000,     // 30min (V0.1 开发期紧凑值,V0.2 生产期可调到 4h)
   AUTO_TICK_EVERY_N_LOOPS: 4,        // 每 4 个 loop (~2 分钟) 触发 tickAutoOpen
@@ -1683,25 +1683,8 @@ async function tickPositions() {
         }
       }
 
-      // 3. fee 复投
-      const feePctOfPosition = openValueUsd > 0 ? (feeUsd / openValueUsd) * 100 : 0;
-      if (feePctOfPosition > CONFIG.CLAIM_THRESHOLD_PCT && !state.paused) {
-        await notify(
-          `💰 <b>${p.pairName} 累计 fee 达阈值</b>\n` +
-          `fee: ${fmtUsd(feeUsd)} (${feePctOfPosition.toFixed(2)}% of position)\n` +
-          `claiming...`
-        );
-        try {
-          const sig = await claimFees(p.positionPk);
-          await db.query(
-            `UPDATE positions SET fees_claimed_usd = fees_claimed_usd + $2 WHERE id = $1`,
-            [dbId, feeUsd]
-          );
-          await notify(`✅ claim 成功: <code>${sig}</code>`);
-        } catch (e: any) {
-          await notify(`❌ claim 失败: ${e.message}`);
-        }
-      }
+      // V0.8 Zip 1: 老 claim 触发点(CLAIM_THRESHOLD_PCT)已移除
+      // 现在统一走 #3 自动 Claim Agent (每 6h, 阈值 $5),避免双触发冲突
     } catch (e: any) {
       console.error(`tickPositions ${p.positionPk}: ${e.message}`);
     }
@@ -2653,6 +2636,11 @@ async function runAutoClaimAgent(): Promise<void> {
             totalClaimedUsd += feeUsd;
             claimCount++;
             results.push(`${p.pairName}: ${fmtUsd(feeUsd)}`);
+            // 累计到 DB 老字段(向后兼容 /status 显示)
+            await db.query(
+              `UPDATE positions SET fees_claimed_usd = fees_claimed_usd + $2 WHERE position_pk = $1`,
+              [p.positionPk, feeUsd]
+            ).catch(e => console.error(`[auto-claim] db update fees_claimed_usd: ${e.message}`));
             console.log(`[auto-claim] ${p.pairName} fee=${fmtUsd(feeUsd)} sig=${sig}`);
           }
         } catch (e: any) {
@@ -2910,7 +2898,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.8 (Zip 1: AutoClaim + Health + MarketRegime)\n` +
+    `Version: V0.8.1 (Zip 1 + claim conflict fix)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
