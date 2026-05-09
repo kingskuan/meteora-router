@@ -79,6 +79,15 @@ const CONFIG = {
   LOW_GAS_THRESHOLD_SOL: 0.05,              // SOL 余额低于此值发预警(0.05 SOL ≈ 几十笔 gas)
   GAS_CHECK_EVERY_N_LOOPS: 4,               // 每 N 个 loop 检查一次 SOL 余额(约 2 分钟)
 
+  // V0.8 Zip 1: Agents
+  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || '',
+  ANTHROPIC_MODEL: 'claude-haiku-4-5-20251001',
+  AUTO_CLAIM_ENABLED: (process.env.AUTO_CLAIM_ENABLED || 'true').toLowerCase() === 'true',
+  AUTO_CLAIM_THRESHOLD_USD: parseFloat(process.env.AUTO_CLAIM_THRESHOLD_USD || '5'),
+  AUTO_CLAIM_INTERVAL_MS: parseInt(process.env.AUTO_CLAIM_INTERVAL_MS || (6 * 3600_000).toString()),  // 6 小时
+  HEALTH_CHECK_INTERVAL_MS: parseInt(process.env.HEALTH_CHECK_INTERVAL_MS || (24 * 3600_000).toString()),  // 24 小时
+  MARKET_REGIME_INTERVAL_MS: parseInt(process.env.MARKET_REGIME_INTERVAL_MS || (4 * 3600_000).toString()), // 4 小时
+
   // API
   METEORA_API_HOSTS: [
     'https://dlmm.datapi.meteora.ag',
@@ -2012,7 +2021,8 @@ bot.command('help', async (ctx) => {
     `/pool [addr] - 池子详情\n` +
     `/scan - 扫描白名单池子\n` +
     `/positions - 仓位详情\n` +
-    `/pnl - 盈亏报表\n\n` +
+    `/pnl - 盈亏报表\n` +
+    `/agents - Agent 运行状态\n\n` +
     `<b>控制</b>\n` +
     `/auto on|off - 全自动开关\n` +
     `/now - 立刻触发一次自动决策(测试用)\n` +
@@ -2027,9 +2037,44 @@ bot.command('help', async (ctx) => {
     `/discover - 自动抓 Meteora top 池子加入候选\n` +
     `/addpool &lt;addr&gt; - 加候选池\n` +
     `/rmpool &lt;addr&gt; - 移除候选池\n\n` +
-    `<i>V0.1.1</i>`,
+    `<i>V0.8</i>`,
     { parse_mode: 'HTML' }
   );
+});
+
+bot.command('agents', async (ctx) => {
+  const fmtAgo = (ts: number) => ts === 0 ? '尚未运行' : `${Math.floor((Date.now() - ts) / 60000)} 分钟前`;
+  const fmtNext = (lastTs: number, intervalMs: number) => {
+    const next = lastTs + intervalMs - Date.now();
+    if (next <= 0) return '即将运行';
+    const min = Math.floor(next / 60000);
+    return min < 60 ? `${min} 分钟后` : `${(min / 60).toFixed(1)} 小时后`;
+  };
+  const llmAvailable = CONFIG.ANTHROPIC_API_KEY ? '✅ 已配置' : '❌ 未配置';
+  const claimEmoji = CONFIG.AUTO_CLAIM_ENABLED ? '🟢' : '⚪';
+
+  const msg =
+    `<b>🤖 Agents 状态</b>\n\n` +
+    `<b>${claimEmoji} #3 自动 Claim</b> (定时, 不用 LLM)\n` +
+    `阈值: ${fmtUsd(CONFIG.AUTO_CLAIM_THRESHOLD_USD)} | 间隔: ${(CONFIG.AUTO_CLAIM_INTERVAL_MS / 3600000).toFixed(1)}h\n` +
+    `上次: ${fmtAgo(agentState.lastAutoClaimAt)}\n` +
+    `下次: ${fmtNext(agentState.lastAutoClaimAt, CONFIG.AUTO_CLAIM_INTERVAL_MS)}\n` +
+    `结果: ${agentState.lastClaimResult}\n\n` +
+    `<b>🟢 #5 健康巡检</b> (定时, 不用 LLM)\n` +
+    `间隔: ${(CONFIG.HEALTH_CHECK_INTERVAL_MS / 3600000).toFixed(1)}h\n` +
+    `上次: ${fmtAgo(agentState.lastHealthCheckAt)}\n` +
+    `下次: ${fmtNext(agentState.lastHealthCheckAt, CONFIG.HEALTH_CHECK_INTERVAL_MS)}\n` +
+    `结果: ${agentState.lastHealthResult}\n\n` +
+    `<b>🟢 #2 市场状态</b> (LLM Haiku)\n` +
+    `LLM API: ${llmAvailable}\n` +
+    `间隔: ${(CONFIG.MARKET_REGIME_INTERVAL_MS / 3600000).toFixed(1)}h\n` +
+    `上次: ${fmtAgo(agentState.lastMarketRegimeAt)}\n` +
+    `下次: ${fmtNext(agentState.lastMarketRegimeAt, CONFIG.MARKET_REGIME_INTERVAL_MS)}\n` +
+    `当前: ${agentState.lastMarketRegime}\n` +
+    `理由: ${agentState.lastMarketReason}\n\n` +
+    `<b>💸 LLM 累计成本</b>: $${agentState.llmCostUsd.toFixed(4)}`;
+
+  await ctx.reply(msg, { parse_mode: 'HTML' });
 });
 
 bot.command('status', async (ctx) => {
@@ -2515,6 +2560,291 @@ async function checkLowGasAndAlert(): Promise<void> {
   }
 }
 
+// ============================================================
+// 16.5 V0.8 Zip 1: Agents
+// ============================================================
+
+// Agent 运行状态(/agents 命令展示)
+const agentState = {
+  lastAutoClaimAt: 0,
+  lastHealthCheckAt: 0,
+  lastMarketRegimeAt: 0,
+  llmCostUsd: 0,                        // 累计 LLM API 成本
+  lastClaimResult: '尚未运行',
+  lastHealthResult: '尚未运行',
+  lastMarketRegime: '未知' as '稳定' | '震荡' | '趋势' | '高波动' | '未知',
+  lastMarketReason: '尚未运行',
+};
+
+/**
+ * 调用 Claude Haiku API
+ * - 60 秒超时,2 次重试
+ * - 失败抛错,调用方决定是否兜底
+ */
+async function callClaude(prompt: string, maxTokens: number = 500): Promise<string> {
+  if (!CONFIG.ANTHROPIC_API_KEY) {
+    throw new Error('ANTHROPIC_API_KEY 未配置');
+  }
+
+  const r = await retry(async () => {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': CONFIG.ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: CONFIG.ANTHROPIC_MODEL,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`Claude API ${res.status}: ${errText.slice(0, 200)}`);
+    }
+    return res;
+  }, 2, 2000);
+
+  const data: any = await r.json();
+  const text = data.content?.[0]?.text || '';
+
+  // 成本估算 (Haiku 4.5: ~$1/M input, ~$5/M output tokens)
+  const inputTok = data.usage?.input_tokens || 0;
+  const outputTok = data.usage?.output_tokens || 0;
+  const cost = (inputTok / 1_000_000) * 1 + (outputTok / 1_000_000) * 5;
+  agentState.llmCostUsd += cost;
+  console.log(`[llm] in=${inputTok} out=${outputTok} cost=$${cost.toFixed(5)} cumul=$${agentState.llmCostUsd.toFixed(4)}`);
+
+  return text.trim();
+}
+
+/**
+ * Agent #3: 自动 Claim Agent (定时,不用 LLM)
+ * 扫所有 open 仓位,fee USD > 阈值 → claim
+ */
+async function runAutoClaimAgent(): Promise<void> {
+  if (!CONFIG.AUTO_CLAIM_ENABLED) { agentState.lastClaimResult = '已禁用'; return; }
+  if (state.paused) { agentState.lastClaimResult = 'bot paused, 跳过'; return; }
+  if (state.rebalancing) { agentState.lastClaimResult = 'rebalance 中, 跳过'; return; }
+
+  try {
+    const positions = await getUserPositions();
+    if (positions.length === 0) {
+      agentState.lastClaimResult = '无 open 仓位';
+      agentState.lastAutoClaimAt = Date.now();
+      return;
+    }
+
+    let totalClaimedUsd = 0;
+    let claimCount = 0;
+    const results: string[] = [];
+
+    for (const p of positions) {
+      const xPrice = await getTokenPriceUsd(p.tokenXMint).catch(() => 0);
+      const yPrice = await getTokenPriceUsd(p.tokenYMint).catch(() => 0);
+      const feeUsd = (p.unclaimedFeeXFloat || 0) * xPrice + (p.unclaimedFeeYFloat || 0) * yPrice;
+      if (feeUsd >= CONFIG.AUTO_CLAIM_THRESHOLD_USD) {
+        try {
+          const sig = await claimFees(p.positionPk);
+          if (sig !== 'NO_FEES') {
+            totalClaimedUsd += feeUsd;
+            claimCount++;
+            results.push(`${p.pairName}: ${fmtUsd(feeUsd)}`);
+            console.log(`[auto-claim] ${p.pairName} fee=${fmtUsd(feeUsd)} sig=${sig}`);
+          }
+        } catch (e: any) {
+          console.error(`[auto-claim] ${p.pairName} failed: ${e.message}`);
+        }
+      }
+    }
+
+    if (claimCount > 0) {
+      await notify(
+        `💰 <b>自动 Claim</b>\n` +
+        `共领取 ${claimCount} 次,合计 ${fmtUsd(totalClaimedUsd)}\n` +
+        results.map(r => `• ${r}`).join('\n')
+      );
+    }
+
+    agentState.lastClaimResult = claimCount > 0
+      ? `✅ ${claimCount} claims, ${fmtUsd(totalClaimedUsd)}`
+      : `无可 claim (阈值 ${fmtUsd(CONFIG.AUTO_CLAIM_THRESHOLD_USD)})`;
+    agentState.lastAutoClaimAt = Date.now();
+  } catch (e: any) {
+    console.error(`[auto-claim] error: ${e.message}`);
+    agentState.lastClaimResult = `❌ ${e.message.slice(0, 80)}`;
+  }
+}
+
+/**
+ * Agent #5: 健康巡检 Agent (定时,不用 LLM)
+ * 检查: SOL 余额、DB 大小、幽灵仓位、7d PnL
+ */
+async function runHealthCheckAgent(): Promise<void> {
+  try {
+    const issues: string[] = [];
+    const info: string[] = [];
+
+    // 1. SOL 余额
+    const solBal = (await connection.getBalance(wallet.publicKey)) / 1e9;
+    info.push(`SOL: ${solBal.toFixed(4)}`);
+    if (solBal < CONFIG.LOW_GAS_THRESHOLD_SOL * 2) {
+      issues.push(`⚠️ SOL ${solBal.toFixed(4)} 偏低,建议补充到 0.2+ SOL`);
+    }
+
+    // 2. DB 大小
+    try {
+      const r = await db.query<{ size: string }>(`SELECT pg_size_pretty(pg_database_size(current_database())) as size`);
+      info.push(`DB: ${r.rows[0].size}`);
+    } catch {}
+
+    // 3. 幽灵仓位检查
+    try {
+      const dbOpen = await db.query<{ position_pk: string; pair_name: string }>(
+        `SELECT position_pk, pair_name FROM positions WHERE status = 'open'`
+      );
+      const onchain = await getUserPositions();
+      const onchainPks = new Set(onchain.map(p => p.positionPk));
+      const ghosts = dbOpen.rows.filter(r => !onchainPks.has(r.position_pk));
+      if (ghosts.length > 0) {
+        issues.push(`⚠️ ${ghosts.length} 幽灵仓位(DB open / 链上无):\n` +
+          ghosts.map(g => `  ${g.pair_name} ${g.position_pk.slice(0, 8)}...`).join('\n'));
+      }
+      info.push(`仓位: ${onchain.length} 链上 / ${dbOpen.rows.length} DB`);
+    } catch (e: any) { console.error(`[health] ghost: ${e.message}`); }
+
+    // 4. 7d PnL
+    try {
+      const r = await db.query<{ cnt: string; total: string; wins: string }>(
+        `SELECT COUNT(*) as cnt, COALESCE(SUM(pnl_usd), 0) as total,
+                SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins
+         FROM pnl_history WHERE closed_at > NOW() - INTERVAL '7 days'`
+      );
+      const cnt = parseInt(r.rows[0].cnt);
+      const total = parseFloat(r.rows[0].total);
+      const wins = parseInt(r.rows[0].wins);
+      if (cnt > 0) {
+        const wr = (wins / cnt) * 100;
+        info.push(`7d PnL: ${total >= 0 ? '+' : ''}${fmtUsd(total)} (${cnt} trades, WR ${wr.toFixed(0)}%)`);
+      } else {
+        info.push(`7d PnL: 暂无数据`);
+      }
+    } catch {}
+
+    // 5. LLM 累计成本
+    info.push(`LLM 成本累计: $${agentState.llmCostUsd.toFixed(4)}`);
+
+    // 6. 当前市场状态
+    if (agentState.lastMarketRegime !== '未知') {
+      info.push(`市场: ${agentState.lastMarketRegime} (${agentState.lastMarketReason})`);
+    }
+
+    const header = issues.length > 0 ? '🩺 <b>健康巡检 (有警告)</b>' : '🩺 <b>健康巡检 (一切正常)</b>';
+    const body = info.map(i => `• ${i}`).join('\n');
+    const warns = issues.length > 0 ? '\n\n' + issues.join('\n') : '';
+    await notify(`${header}\n\n${body}${warns}`);
+
+    agentState.lastHealthResult = issues.length > 0 ? `⚠️ ${issues.length} warnings` : '✅ all ok';
+    agentState.lastHealthCheckAt = Date.now();
+  } catch (e: any) {
+    console.error(`[health] error: ${e.message}`);
+    agentState.lastHealthResult = `❌ ${e.message.slice(0, 80)}`;
+  }
+}
+
+/**
+ * Agent #2: 市场状态 Agent (LLM)
+ * 拉 24h SOL ohlcv → Claude Haiku 分类: 稳定/震荡/趋势/高波动
+ * 只通知状态切换,避免刷屏
+ */
+async function runMarketRegimeAgent(): Promise<void> {
+  if (!CONFIG.ANTHROPIC_API_KEY) {
+    agentState.lastMarketReason = 'API key 未配置,agent 已禁用';
+    return;
+  }
+
+  try {
+    const solPrice = await getTokenPriceUsd(SOL_MINT).catch(() => 0);
+    if (solPrice === 0) {
+      agentState.lastMarketReason = '无法获取 SOL 价格';
+      return;
+    }
+
+    // 拉 24h SOL/USDC ohlcv (用 SOL/USDC 主流池)
+    let ohlcvSummary = '近期数据缺失';
+    try {
+      const url = `${CONFIG.GECKOTERMINAL_API}/networks/solana/pools/3ne4mWqdYuNiYrYZC9TrA3FcfuFdErghH97vNPbjicr1/ohlcv/hour?aggregate=1&limit=24`;
+      const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const data: any = await r.json();
+      const candles = data?.data?.attributes?.ohlcv_list || [];
+      if (candles.length >= 12) {
+        const prices = candles.map((c: any[]) => c[4]);
+        const high = Math.max(...prices);
+        const low = Math.min(...prices);
+        const last = prices[0];
+        const first = prices[prices.length - 1];
+        const change = ((last - first) / first) * 100;
+        const range = ((high - low) / low) * 100;
+        ohlcvSummary = `24h: ${first.toFixed(2)} → ${last.toFixed(2)} (${change >= 0 ? '+' : ''}${change.toFixed(2)}%), 区间波动 ${range.toFixed(2)}%`;
+      }
+    } catch (e: any) {
+      console.error(`[market-regime] ohlcv: ${e.message}`);
+    }
+
+    const prompt = `你是加密 LP 市场分析助手。基于以下 SOL 数据,把当前市场状态归类为以下 4 类之一:
+
+- 稳定: 24h 总体波动 < 3%, 价格平稳
+- 震荡: 24h 波动 3-7%, 来回拉锯无明确方向
+- 趋势: 24h 单向 > 5%, 涨/跌一边倒
+- 高波动: 24h 区间 > 10% 或剧烈上下震荡
+
+数据:
+当前 SOL 价: $${solPrice.toFixed(2)}
+${ohlcvSummary}
+
+严格按 JSON 返回,不要任何额外文字:
+{"regime": "稳定|震荡|趋势|高波动", "reason": "30字内一句话理由"}`;
+
+    const reply = await callClaude(prompt, 200);
+    const jsonMatch = reply.match(/\{[\s\S]*?\}/);
+    if (!jsonMatch) {
+      agentState.lastMarketReason = `LLM 返回格式错: ${reply.slice(0, 80)}`;
+      console.error(`[market-regime] no json in reply: ${reply}`);
+      return;
+    }
+    const parsed = JSON.parse(jsonMatch[0]);
+    const regime = parsed.regime;
+    const reason = parsed.reason || '';
+
+    if (!['稳定', '震荡', '趋势', '高波动'].includes(regime)) {
+      agentState.lastMarketReason = `未知 regime: ${regime}`;
+      return;
+    }
+
+    const prevRegime = agentState.lastMarketRegime;
+    agentState.lastMarketRegime = regime;
+    agentState.lastMarketReason = reason;
+    agentState.lastMarketRegimeAt = Date.now();
+
+    // 状态切换才通知,避免刷屏
+    if (regime !== prevRegime) {
+      const emoji = ({ '稳定': '😴', '震荡': '🌊', '趋势': '📈', '高波动': '⚡' } as any)[regime] || '❓';
+      await notify(
+        `${emoji} <b>市场状态: ${regime}</b>\n` +
+        `${reason}\n\n` +
+        `(切换自: ${prevRegime})\n` +
+        `${ohlcvSummary}`
+      );
+    }
+  } catch (e: any) {
+    console.error(`[market-regime] error: ${e.message}`);
+    agentState.lastMarketReason = `❌ ${e.message.slice(0, 80)}`;
+  }
+}
+
 let tickCounter = 0;
 
 async function mainLoop() {
@@ -2530,6 +2860,17 @@ async function mainLoop() {
       // V2: SOL gas 预警 — 每 N 个 loop 检查一次(默认 2 分钟)
       if (tickCounter % CONFIG.GAS_CHECK_EVERY_N_LOOPS === 0) {
         await checkLowGasAndAlert();
+      }
+      // V0.8 Zip 1: Agents (基于时间间隔触发,不和 loop count 绑死)
+      const now = Date.now();
+      if (now - agentState.lastAutoClaimAt > CONFIG.AUTO_CLAIM_INTERVAL_MS) {
+        await runAutoClaimAgent();
+      }
+      if (now - agentState.lastHealthCheckAt > CONFIG.HEALTH_CHECK_INTERVAL_MS) {
+        await runHealthCheckAgent();
+      }
+      if (now - agentState.lastMarketRegimeAt > CONFIG.MARKET_REGIME_INTERVAL_MS) {
+        await runMarketRegimeAgent();
       }
     } catch (e: any) {
       console.error(`[loop] error: ${e.message}`);
@@ -2569,15 +2910,17 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.7 (PnL ledger + auto pnl tracking)\n` +
+    `Version: V0.8 (Zip 1: AutoClaim + Health + MarketRegime)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
-    `候选池: ${state.candidatePools.length}\n\n` +
+    `候选池: ${state.candidatePools.length}\n` +
+    `LLM API: ${CONFIG.ANTHROPIC_API_KEY ? '🟢 已配置 (Haiku)' : '⚪ 未配置 (#2 agent 跳过)'}\n` +
+    `自动 Claim: ${CONFIG.AUTO_CLAIM_ENABLED ? `🟢 阈值 ${fmtUsd(CONFIG.AUTO_CLAIM_THRESHOLD_USD)}` : '⚪ 已禁用'}\n\n` +
     `下一步:\n` +
-    `1. /discover 自动抓 top 池子(推荐)\n` +
-    `2. /scan 看候选池打分\n` +
-    `3. DRY_RUN=true 时可以放心 /auto on 测试\n` +
-    `4. 验证逻辑没问题后 Railway 改 DRY_RUN=false 上实盘\n\n` +
+    `1. /agents 查看 agent 状态\n` +
+    `2. /pnl 查看 PnL 账本\n` +
+    `3. /discover 自动抓 top 池子\n` +
+    `4. DRY_RUN=true 时可以放心 /auto on 测试\n\n` +
     `/help 查看所有命令`
   );
 

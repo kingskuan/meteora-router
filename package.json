@@ -1,7 +1,7 @@
 {
   "name": "meteora-router",
-  "version": "0.7.0",
-  "description": "Meteora DLMM auto rebalance bot - V0.7 (PnL ledger + auto pnl tracking)",
+  "version": "0.8.0",
+  "description": "Meteora DLMM auto rebalance bot - V0.8 Zip 1 (AutoClaim + Health + MarketRegime agents)",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc",
