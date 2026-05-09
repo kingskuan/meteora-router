@@ -282,6 +282,22 @@ async function initDb() {
     );
     -- migration: 加 disabled_reason 列(用于自动禁用坏池子)
     ALTER TABLE candidate_pools ADD COLUMN IF NOT EXISTS disabled_reason TEXT;
+
+    -- V3: PnL 损益账本(每次 close/rebalance 记一行)
+    CREATE TABLE IF NOT EXISTS pnl_history (
+      id SERIAL PRIMARY KEY,
+      position_pk TEXT NOT NULL,
+      pair_name TEXT NOT NULL,
+      lb_pair TEXT NOT NULL,
+      open_value_usd NUMERIC(18,4) NOT NULL,
+      close_value_usd NUMERIC(18,4) NOT NULL,
+      pnl_usd NUMERIC(18,4) NOT NULL,
+      pnl_pct NUMERIC(10,4) NOT NULL,
+      hold_minutes INT NOT NULL,
+      reason TEXT NOT NULL,
+      closed_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_pnl_pair ON pnl_history(pair_name, closed_at DESC);
   `);
   // seed default candidates
   for (const addr of CANDIDATE_POOLS_DEFAULT) {
@@ -290,7 +306,7 @@ async function initDb() {
       [addr]
     );
   }
-  console.log('🗄️  DB schema ready');
+  console.log('[db] schema 已就绪 (Phase 2A.5 hold_minutes + V3 pnl_history)');
 }
 
 async function logEvent(type: string, payload: any = {}) {
@@ -1445,15 +1461,20 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
 
 /**
  * 关仓 + 收 fee + 关闭 position 账户
+ * V3: reason !== 'rebalance' 时,在 close 前后做钱包快照,自动写 PnL 账本
+ *     (rebalance 路径外层 rebalancePosition 自己快照 + 写,这里跳过避免重复)
  */
 async function closePosition(positionPk: string, reason: string = 'manual'): Promise<string> {
-  const r = await db.query<{ id: number; lb_pair: string }>(
-    `SELECT id, lb_pair FROM positions WHERE position_pk = $1 AND status IN ('open','closing')`,
+  const r = await db.query<{ id: number; lb_pair: string; pair_name: string; open_value_usd: string; opened_at: Date }>(
+    `SELECT id, lb_pair, pair_name, open_value_usd, opened_at FROM positions WHERE position_pk = $1 AND status IN ('open','closing')`,
     [positionPk]
   );
   if (r.rows.length === 0) throw new Error(`未找到 open 状态的 position ${positionPk}`);
   const dbId = r.rows[0].id;
   const lbPair = r.rows[0].lb_pair;
+  const pairName = r.rows[0].pair_name;
+  const openValueUsd = Number(r.rows[0].open_value_usd);
+  const openedAt = r.rows[0].opened_at;
 
   await db.query(`UPDATE positions SET status = 'closing' WHERE id = $1`, [dbId]);
   await notify(`🔻 <b>关仓中...</b> ${reason}\nposition: <code>${positionPk}</code>`);
@@ -1466,6 +1487,19 @@ async function closePosition(positionPk: string, reason: string = 'manual'): Pro
     await db.query(`UPDATE positions SET status = 'closed', closed_at = NOW() WHERE id = $1`, [dbId]);
     await notify(`⚠️ position 链上已不存在,标记 closed`);
     return 'NOT_FOUND';
+  }
+
+  // V3: manual 路径做快照(rebalance 路径外层做了,reason='rebalance' 跳过)
+  const shouldRecordPnl = reason !== 'rebalance';
+  let beforeUsd = 0;
+  let xMint = '', yMint = '';
+  let xDec = 9, yDec = 6;
+  if (shouldRecordPnl) {
+    xMint = dlmmPool.tokenX.publicKey.toBase58();
+    yMint = dlmmPool.tokenY.publicKey.toBase58();
+    xDec = (dlmmPool.tokenX as any)?.mint?.decimals ?? (dlmmPool.tokenX as any)?.decimal ?? KNOWN_TOKENS[xMint]?.decimals ?? 9;
+    yDec = (dlmmPool.tokenY as any)?.mint?.decimals ?? (dlmmPool.tokenY as any)?.decimal ?? KNOWN_TOKENS[yMint]?.decimals ?? 6;
+    beforeUsd = await snapshotPairUsd(xMint, yMint, xDec, yDec);
   }
 
   const binIds = pos.positionData.positionBinData.map((b: any) => b.binId);
@@ -1489,6 +1523,31 @@ async function closePosition(positionPk: string, reason: string = 'manual'): Pro
     [dbId, { closeSig: lastSig, closeReason: reason }]
   );
   await logTx(dbId, lastSig, 'close', true, null, { reason });
+
+  // V3: manual 路径写 PnL 账本
+  if (shouldRecordPnl) {
+    try {
+      await sleep(3000); // 等链上结算
+      const afterUsd = await snapshotPairUsd(xMint, yMint, xDec, yDec);
+      const closeValueUsd = afterUsd - beforeUsd;
+      // 兜底:负数或异常小,用 open_value(避免脏数据)
+      const recordedClose = closeValueUsd > 0.5 ? closeValueUsd : openValueUsd;
+      const pnlUsd = recordedClose - openValueUsd;
+      const pnlPct = openValueUsd > 0 ? (pnlUsd / openValueUsd) * 100 : 0;
+      const holdMinutes = Math.max(1, Math.floor((Date.now() - new Date(openedAt).getTime()) / 60000));
+      await db.query(
+        `INSERT INTO pnl_history(position_pk, pair_name, lb_pair, open_value_usd, close_value_usd, pnl_usd, pnl_pct, hold_minutes, reason)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [positionPk, pairName, lbPair, openValueUsd, recordedClose, pnlUsd, pnlPct, holdMinutes, reason]
+      );
+      await notify(
+        `📊 <b>PnL</b>: ${pnlUsd >= 0 ? '+' : ''}${fmtUsd(pnlUsd)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)\n` +
+        `持仓 ${holdMinutes} 分钟 · 已写入账本`
+      );
+    } catch (e: any) {
+      console.error(`[closePosition pnl record] ${e.message}`);
+    }
+  }
 
   await notify(
     `✅ <b>关仓成功</b> (${reason})\n` +
@@ -1662,6 +1721,22 @@ async function snapshotPairUsd(
 }
 
 /**
+ * V3: 取 position 的持仓时长(分钟)
+ */
+async function getHoldMinutes(positionPk: string): Promise<number> {
+  try {
+    const r = await db.query<{ opened_at: Date }>(
+      `SELECT opened_at FROM positions WHERE position_pk = $1`,
+      [positionPk]
+    );
+    if (r.rows.length === 0) return 0;
+    return Math.max(1, Math.floor((Date.now() - new Date(r.rows[0].opened_at).getTime()) / 60000));
+  } catch {
+    return 0;
+  }
+}
+
+/**
  * 重建仓位 (V2.3):
  * - close 前后快照钱包余额,差值 = 这次仓位真正解出的钱(自动包含 fee + IL)
  * - 报告真 IL: 仓位实际解出 vs 原始投入
@@ -1727,6 +1802,19 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
       `(原 ${fmtUsd(originalValueUsd)}, IL ${ilPct >= 0 ? '+' : ''}${ilPct.toFixed(2)}%)\n` +
       `重建金额: ${fmtUsd(reopenAmount)}`
     );
+
+    // V3: 写入 PnL 账本(rebalance close 也是 close,记一行)
+    try {
+      const holdMinutes = await getHoldMinutes(p.positionPk);
+      await db.query(
+        `INSERT INTO pnl_history(position_pk, pair_name, lb_pair, open_value_usd, close_value_usd, pnl_usd, pnl_pct, hold_minutes, reason)
+         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [p.positionPk, p.pairName, lbPair, originalValueUsd, actualUsd, ilDiff, ilPct, holdMinutes, 'rebalance']
+      );
+    } catch (dbErr: any) {
+      console.error(`[pnl_history insert error] ${dbErr.message}`);
+      // 不影响主流程
+    }
 
     await openPosition(lbPair, reopenAmount);
 
@@ -2078,36 +2166,74 @@ bot.command('positions', async (ctx) => {
 bot.command('pnl', async (ctx) => {
   await ctx.reply('⏳');
   try {
-    const r = await db.query<{
+    // V3: 从 pnl_history 真账本读
+    const aggR = await db.query<{
       pair_name: string;
-      open_value_usd: string;
-      fees_claimed_usd: string;
-      il_realized_usd: string;
-      status: string;
-      opened_at: Date;
-      closed_at: Date | null;
-    }>(`SELECT pair_name, open_value_usd, fees_claimed_usd, il_realized_usd, status, opened_at, closed_at FROM positions ORDER BY opened_at DESC LIMIT 20`);
+      cnt: string;
+      total_pnl: string;
+      avg_pnl_pct: string;
+      total_open: string;
+      wins: string;
+      losses: string;
+      total_hold_minutes: string;
+    }>(`
+      SELECT
+        pair_name,
+        COUNT(*) as cnt,
+        SUM(pnl_usd) as total_pnl,
+        AVG(pnl_pct) as avg_pnl_pct,
+        SUM(open_value_usd) as total_open,
+        SUM(CASE WHEN pnl_usd > 0 THEN 1 ELSE 0 END) as wins,
+        SUM(CASE WHEN pnl_usd <= 0 THEN 1 ELSE 0 END) as losses,
+        SUM(hold_minutes) as total_hold_minutes
+      FROM pnl_history
+      GROUP BY pair_name
+      ORDER BY total_pnl DESC
+    `);
 
-    let totalFees = 0;
-    let totalIl = 0;
-    let openCount = 0;
-    let closedCount = 0;
-    for (const row of r.rows) {
-      totalFees += parseFloat(row.fees_claimed_usd || '0');
-      totalIl += parseFloat(row.il_realized_usd || '0');
-      if (row.status === 'open') openCount++;
-      else if (row.status === 'closed') closedCount++;
+    if (aggR.rows.length === 0) {
+      await ctx.reply('📊 还没有任何 close 记录,等仓位 rebalance 或手动 close 后再看', { parse_mode: 'HTML' });
+      return;
     }
 
-    let msg = `<b>💰 PnL Summary</b>\n\n` +
-      `开仓中: ${openCount}, 已关: ${closedCount}\n` +
-      `已收 fee: ${fmtUsd(totalFees)}\n` +
-      `已实现 IL: ${fmtUsd(-totalIl)}\n` +
-      `净: ${fmtUsd(totalFees - totalIl)}\n\n` +
-      `<b>最近 20 笔</b>\n`;
-    for (const row of r.rows) {
-      const tag = row.status === 'open' ? '🟢' : '⚪';
-      msg += `${tag} ${row.pair_name} ${fmtUsd(parseFloat(row.open_value_usd))} fee=${fmtUsd(parseFloat(row.fees_claimed_usd))}\n`;
+    let grandPnl = 0, grandTrades = 0, grandWins = 0;
+    let msg = `<b>📊 累计 PnL 账本</b>\n(V0.6.3 起的 close 记录)\n\n`;
+    for (const row of aggR.rows) {
+      const cnt = parseInt(row.cnt);
+      const pnl = parseFloat(row.total_pnl);
+      const avgPct = parseFloat(row.avg_pnl_pct);
+      const wins = parseInt(row.wins);
+      const wr = cnt > 0 ? (wins / cnt) * 100 : 0;
+      const totalHoldH = (parseInt(row.total_hold_minutes) / 60).toFixed(1);
+      const tag = pnl >= 0 ? '🟢' : '🔴';
+      msg += `${tag} <b>${row.pair_name}</b>\n` +
+        `  ${cnt} 次 close · 累计 ${pnl >= 0 ? '+' : ''}${fmtUsd(pnl)}\n` +
+        `  平均 ${avgPct >= 0 ? '+' : ''}${avgPct.toFixed(2)}% · WR ${wr.toFixed(0)}% (${wins}/${cnt})\n` +
+        `  持仓 ${totalHoldH}h\n\n`;
+      grandPnl += pnl;
+      grandTrades += cnt;
+      grandWins += wins;
+    }
+    const grandWr = grandTrades > 0 ? (grandWins / grandTrades) * 100 : 0;
+    msg += `─────────────\n<b>合计</b>: ${grandPnl >= 0 ? '+' : ''}${fmtUsd(grandPnl)} · ${grandTrades} trades · WR ${grandWr.toFixed(0)}%\n\n`;
+
+    // 最近 5 笔
+    const recentR = await db.query<{
+      pair_name: string;
+      pnl_usd: string;
+      pnl_pct: string;
+      reason: string;
+      hold_minutes: number;
+      closed_at: Date;
+    }>(`SELECT pair_name, pnl_usd, pnl_pct, reason, hold_minutes, closed_at FROM pnl_history ORDER BY closed_at DESC LIMIT 5`);
+
+    msg += `<b>最近 5 笔</b>\n`;
+    for (const row of recentR.rows) {
+      const pnl = parseFloat(row.pnl_usd);
+      const pnlPct = parseFloat(row.pnl_pct);
+      const tag = pnl >= 0 ? '🟢' : '🔴';
+      const dt = new Date(row.closed_at).toISOString().slice(5, 16).replace('T', ' ');
+      msg += `${tag} ${dt} ${row.pair_name} ${pnl >= 0 ? '+' : ''}${fmtUsd(pnl)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%) ${row.reason}\n`;
     }
     await ctx.reply(msg, { parse_mode: 'HTML' });
   } catch (e: any) {
@@ -2443,7 +2569,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.6.3 (snapshot-diff IL + rebalancing flag + jupiter retry)\n` +
+    `Version: V0.7 (PnL ledger + auto pnl tracking)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n\n` +

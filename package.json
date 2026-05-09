@@ -1,7 +1,7 @@
 {
   "name": "meteora-router",
-  "version": "0.6.3",
-  "description": "Meteora DLMM auto rebalance bot - V0.6.3 (snapshot-diff IL + rebalancing flag + jupiter retry)",
+  "version": "0.7.0",
+  "description": "Meteora DLMM auto rebalance bot - V0.7 (PnL ledger + auto pnl tracking)",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc",
