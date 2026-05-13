@@ -1,7 +1,7 @@
 {
   "name": "meteora-router",
-  "version": "0.8.1",
-  "description": "Meteora DLMM auto rebalance bot - V0.8.1 (Zip 1 agents + claim conflict fix)",
+  "version": "0.9.2",
+  "description": "Meteora DLMM auto rebalance bot - V0.9.2 (stop-loss + sizing + exposure cap + smart auto-resume)",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc",

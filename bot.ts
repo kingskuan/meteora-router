@@ -51,7 +51,13 @@ const CONFIG = {
   MAX_POSITION_USD: parseFloat(process.env.MAX_POSITION_USD || '200'),
   POOL_COOLDOWN_MINUTES: parseInt(process.env.POOL_COOLDOWN_MINUTES || '60'),
   MAX_OPEN_POSITIONS: parseInt(process.env.MAX_OPEN_POSITIONS || '2'),
-  HARD_SL_PCT: parseFloat(process.env.HARD_SL_PCT || '8'),
+  HARD_SL_PCT: parseFloat(process.env.HARD_SL_PCT || '10'),                 // V0.9: 默认 -10% 硬止损
+  STOP_LOSS_WARN_PCT: parseFloat(process.env.STOP_LOSS_WARN_PCT || '7'),     // V0.9: -7% 软警告
+  STOP_LOSS_CONSECUTIVE: parseInt(process.env.STOP_LOSS_CONSECUTIVE || '2'), // V0.9: 连续 N 次触发才执行,防抖
+  POSITION_PCT: parseFloat(process.env.POSITION_PCT || '0.4'),               // V0.9: 自动开仓占钱包比例
+  TOTAL_EXPOSURE_PCT: parseFloat(process.env.TOTAL_EXPOSURE_PCT || '0.7'),   // V0.9.1: 所有 open 仓位累计 ≤ 钱包此比例
+  AUTO_RESUME_ENABLED: (process.env.AUTO_RESUME_ENABLED || 'true').toLowerCase() === 'true',  // V0.9.2
+  AUTO_RESUME_MIN: parseInt(process.env.AUTO_RESUME_MIN || '60'),            // V0.9.2: 止损后等多少分钟尝试恢复
   EMERGENCY_DUMP_PCT: parseFloat(process.env.EMERGENCY_DUMP_PCT || '15'),
 
   // 策略默认
@@ -130,6 +136,8 @@ interface RuntimeState {
   autoTrading: boolean;     // 自动开仓开关
   firstOpenConfirmed: boolean; // 首次开仓二次确认状态
   rebalancing: boolean;     // V2.3: rebalance 进行中(防 tickAutoOpen 并发触发开仓)
+  autoResumablePausedAt: number; // V0.9.2: 止损/rebalance失败导致的 paused 时间戳(0=非此原因)
+  autoResumeReason: string;      // V0.9.2: 给智能恢复显示用的人话原因
   pendingConfirmation: null | {
     type: 'open';
     lbPair: string;
@@ -145,6 +153,8 @@ const state: RuntimeState = {
   autoTrading: false,
   firstOpenConfirmed: false,
   rebalancing: false,
+  autoResumablePausedAt: 0,
+  autoResumeReason: '',
   pendingConfirmation: null,
   lastScanTs: 0,
   candidatePools: [...CANDIDATE_POOLS_DEFAULT],
@@ -1612,6 +1622,11 @@ function isInRebalanceCooldown(lbPair: string): boolean {
 // V2: rebalance 失败计数(key: lbPair) — 连续失败 ≥ MAX_REBALANCE_FAILS 才 paused,而非单次失败就停
 const rebalanceFailCount = new Map<string, number>();
 
+// V0.9: 止损连续触发计数(key: positionPk)
+// 连续 N 次 tick 都触发硬止损线才真执行,避免单次价格 API 抖动误杀
+const stopLossHitCount = new Map<string, number>();
+const stopLossWarnedSet = new Set<string>(); // 软警告已发送(防刷屏)
+
 async function tickPositions() {
   const positions = await getUserPositions();
 
@@ -1630,20 +1645,51 @@ async function tickPositions() {
       const currentValueWithFee = totalUsd + feeUsd;
       const pnlPct = openValueUsd > 0 ? ((currentValueWithFee - openValueUsd) / openValueUsd) * 100 : 0;
 
-      if (pnlPct < -CONFIG.HARD_SL_PCT) {
-        await notify(
-          `🚨 <b>触发 Stop Loss</b>\n` +
-          `${p.pairName} PnL: ${pnlPct.toFixed(2)}%\n` +
-          `开仓值: ${fmtUsd(openValueUsd)} 现值(含费): ${fmtUsd(currentValueWithFee)}\n` +
-          `自动平仓 + 暂停 bot`
-        );
-        try {
-          await closePosition(p.positionPk, `SL ${pnlPct.toFixed(2)}%`);
-        } catch (e: any) {
-          await notify(`❌ SL 平仓失败: ${e.message}`);
+      // V0.9: 软警告 (-STOP_LOSS_WARN_PCT 触发,只通知一次)
+      if (pnlPct < -CONFIG.STOP_LOSS_WARN_PCT && pnlPct >= -CONFIG.HARD_SL_PCT) {
+        if (!stopLossWarnedSet.has(p.positionPk)) {
+          await notify(
+            `⚠️ <b>${p.pairName} 接近止损线</b>\n` +
+            `PnL: ${pnlPct.toFixed(2)}% (警告线 -${CONFIG.STOP_LOSS_WARN_PCT}%, 止损线 -${CONFIG.HARD_SL_PCT}%)\n` +
+            `开仓值: ${fmtUsd(openValueUsd)} 现值(含费): ${fmtUsd(currentValueWithFee)}`
+          );
+          stopLossWarnedSet.add(p.positionPk);
         }
-        state.paused = true;
-        continue;
+      } else if (pnlPct >= -CONFIG.STOP_LOSS_WARN_PCT) {
+        // 恢复到警告线之上,清除标志(下次跌破再警告)
+        stopLossWarnedSet.delete(p.positionPk);
+      }
+
+      // V0.9: 硬止损 (连续 N 次触发才执行,防单次价格 API 抖动误杀)
+      if (pnlPct < -CONFIG.HARD_SL_PCT) {
+        const hits = (stopLossHitCount.get(p.positionPk) || 0) + 1;
+        stopLossHitCount.set(p.positionPk, hits);
+        console.log(`[stop-loss] ${p.pairName} hit ${hits}/${CONFIG.STOP_LOSS_CONSECUTIVE} pnl=${pnlPct.toFixed(2)}%`);
+
+        if (hits >= CONFIG.STOP_LOSS_CONSECUTIVE) {
+          await notify(
+            `🚨 <b>触发硬止损 (连续 ${hits} 次)</b>\n` +
+            `${p.pairName} PnL: ${pnlPct.toFixed(2)}%\n` +
+            `开仓值: ${fmtUsd(openValueUsd)} 现值(含费): ${fmtUsd(currentValueWithFee)}\n` +
+            `自动平仓 + 暂停 bot`
+          );
+          try {
+            await closePosition(p.positionPk, 'stop_loss');
+          } catch (e: any) {
+            await notify(`❌ 止损平仓失败: ${e.message}`);
+          }
+          state.paused = true;
+          state.autoResumablePausedAt = Date.now();
+          state.autoResumeReason = `止损 ${pnlPct.toFixed(2)}% (${p.pairName})`;
+          stopLossHitCount.delete(p.positionPk);
+          stopLossWarnedSet.delete(p.positionPk);
+          continue;
+        }
+      } else {
+        // 浮亏未达硬止损线,清计数
+        if (stopLossHitCount.has(p.positionPk)) {
+          stopLossHitCount.delete(p.positionPk);
+        }
       }
 
       // 2. 出 range / 漂移 检查 (双触发: single-sided 或 drift 阈值)
@@ -1819,9 +1865,11 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
     if (fails >= CONFIG.MAX_REBALANCE_FAILS) {
       await notify(
         `❌ <b>Rebalance 连续失败 ${fails} 次</b>: ${e.message}\n` +
-        `已暂停 bot,需手动 /resume`
+        `已暂停 bot${CONFIG.AUTO_RESUME_ENABLED ? ',将尝试智能恢复' : ',需手动 /resume'}`
       );
       state.paused = true;
+      state.autoResumablePausedAt = Date.now();
+      state.autoResumeReason = `Rebalance 连续失败 ${fails} 次`;
       rebalanceFailCount.delete(lbPair); // 重置,避免恢复后再次秒爆
     } else {
       await notify(
@@ -1928,7 +1976,7 @@ async function tickAutoOpen(verbose: boolean = false) {
 
   // 计算可投金额(40% of total usable = SOL+USDC+USDT,封顶 MAX_POSITION_USD)
   const wallet_ = await getWalletSnapshot();
-  let investUsd = Math.min(wallet_.totalUsableUsd * 0.4, CONFIG.MAX_POSITION_USD);
+  let investUsd = Math.min(wallet_.totalUsableUsd * CONFIG.POSITION_PCT, CONFIG.MAX_POSITION_USD);
 
   // V2.1: 不再用 SOL 余额硬限制 investUsd
   // (B 版加 Jupiter router 后,USDC/USDT 可自动 swap 成 SOL 补缺口)
@@ -1945,6 +1993,40 @@ async function tickAutoOpen(verbose: boolean = false) {
   }
   console.log(`[tickAutoOpen] investUsd=${investUsd.toFixed(2)} totalUsable=${wallet_.totalUsableUsd.toFixed(2)} solUsd=${wallet_.solUsd.toFixed(2)}`);
 
+  // V0.9.1: 总敞口上限检查 (open positions 累计 + 新仓 ≤ 钱包 × TOTAL_EXPOSURE_PCT)
+  // 钱包总值 = 闲钱 + 已开仓位价值
+  try {
+    const openPositions = await getUserPositions();
+    let openExposureUsd = 0;
+    for (const op of openPositions) {
+      const { totalUsd, feeUsd } = await estimatePositionValueUsd(op);
+      openExposureUsd += totalUsd + feeUsd;
+    }
+    const walletTotalUsd = wallet_.totalUsableUsd + openExposureUsd; // 钱包闲钱 + 仓位价值
+    const exposureCap = walletTotalUsd * CONFIG.TOTAL_EXPOSURE_PCT;
+    const remainingCapacity = exposureCap - openExposureUsd;
+
+    console.log(`[tickAutoOpen] exposure check: open=${openExposureUsd.toFixed(2)} cap=${exposureCap.toFixed(2)} (${(CONFIG.TOTAL_EXPOSURE_PCT * 100).toFixed(0)}% of ${walletTotalUsd.toFixed(2)})`);
+
+    if (remainingCapacity < 5) {
+      await notify(
+        `🚫 <b>跳过开仓 — 总敞口已满</b>\n` +
+        `已开仓: ${fmtUsd(openExposureUsd)} / 上限 ${fmtUsd(exposureCap)} (${(CONFIG.TOTAL_EXPOSURE_PCT * 100).toFixed(0)}% 钱包)\n` +
+        `剩余可投: ${fmtUsd(remainingCapacity)} < $5 阈值`
+      );
+      return;
+    }
+
+    if (investUsd > remainingCapacity) {
+      const oldInvest = investUsd;
+      investUsd = remainingCapacity;
+      console.log(`[tickAutoOpen] exposure cap: ${oldInvest.toFixed(2)} → ${investUsd.toFixed(2)}`);
+    }
+  } catch (e: any) {
+    console.error(`[tickAutoOpen] exposure check failed: ${e.message}`);
+    // 失败兜底:不阻塞开仓,但 log 出来
+  }
+
   if (investUsd < 5) {
     await notify(
       `⚠️ <b>可投金额过小</b>: ${fmtUsd(investUsd)}\n\n` +
@@ -1953,7 +2035,7 @@ async function tickAutoOpen(verbose: boolean = false) {
       `USDC: ${fmtUsd(wallet_.usdcBalance)}\n` +
       `USDT: ${fmtUsd(wallet_.usdtBalance)}\n` +
       `总可用: ${fmtUsd(wallet_.totalUsableUsd)}\n` +
-      `40% 投入 = ${fmtUsd(wallet_.totalUsableUsd * 0.4)}`
+      `${(CONFIG.POSITION_PCT * 100).toFixed(0)}% 投入 = ${fmtUsd(wallet_.totalUsableUsd * CONFIG.POSITION_PCT)}`
     );
     return;
   }
@@ -2314,6 +2396,8 @@ bot.command('pause', async (ctx) => {
 
 bot.command('resume', async (ctx) => {
   state.paused = false;
+  state.autoResumablePausedAt = 0;  // V0.9.2: 手动 resume 也清除自动恢复时间戳
+  state.autoResumeReason = '';
   await ctx.reply('🟢 Resumed');
   await logEvent('resume', {});
 });
@@ -2835,6 +2919,50 @@ ${ohlcvSummary}
 
 let tickCounter = 0;
 
+/**
+ * V0.9.2: 智能恢复 — 止损/rebalance失败导致的 paused,等待市场状态稳定后自动 /resume
+ * 触发条件 (全部满足):
+ *   1. AUTO_RESUME_ENABLED = true
+ *   2. state.paused = true
+ *   3. state.autoResumablePausedAt > 0 (是止损/rebalance失败造成的,不是手动 /pause 或 emergency)
+ *   4. 已等待 ≥ AUTO_RESUME_MIN 分钟
+ *   5. 市场状态 agent 输出 = "稳定" 或 "震荡"
+ */
+async function checkAutoResume(): Promise<void> {
+  if (!CONFIG.AUTO_RESUME_ENABLED) return;
+  if (!state.paused || state.autoResumablePausedAt === 0) return;
+
+  const elapsedMin = (Date.now() - state.autoResumablePausedAt) / 60_000;
+  if (elapsedMin < CONFIG.AUTO_RESUME_MIN) return;
+
+  // 检查市场状态
+  const regime = agentState.lastMarketRegime;
+  const okRegimes = ['稳定', '震荡'];
+
+  if (regime === '未知') {
+    console.log(`[auto-resume] waiting: market regime unknown (${Math.floor(elapsedMin)}min elapsed)`);
+    return;
+  }
+
+  if (!okRegimes.includes(regime)) {
+    // 市场仍动荡,不 resume
+    console.log(`[auto-resume] waiting: regime=${regime} not safe (${Math.floor(elapsedMin)}min elapsed)`);
+    return;
+  }
+
+  // 所有条件满足,自动 resume
+  await notify(
+    `🟢 <b>智能恢复</b>\n` +
+    `已 paused ${Math.floor(elapsedMin)} 分钟,市场状态: ${regime}\n` +
+    `paused 原因: ${state.autoResumeReason}\n` +
+    `自动 /resume 中...`
+  );
+  state.paused = false;
+  state.autoResumablePausedAt = 0;
+  state.autoResumeReason = '';
+  console.log(`[auto-resume] resumed after ${Math.floor(elapsedMin)}min, regime=${regime}`);
+}
+
 async function mainLoop() {
   while (true) {
     try {
@@ -2860,6 +2988,8 @@ async function mainLoop() {
       if (now - agentState.lastMarketRegimeAt > CONFIG.MARKET_REGIME_INTERVAL_MS) {
         await runMarketRegimeAgent();
       }
+      // V0.9.2: 智能恢复 (每个 loop 都检查,但内部有 time gate)
+      await checkAutoResume();
     } catch (e: any) {
       console.error(`[loop] error: ${e.message}`);
       await notify(`⚠️ Loop error: ${e.message}`);
@@ -2898,12 +3028,16 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.8.1 (Zip 1 + claim conflict fix)\n` +
+    `Version: V0.9.2 (stop-loss + sizing + exposure cap + smart auto-resume)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
     `LLM API: ${CONFIG.ANTHROPIC_API_KEY ? '🟢 已配置 (Haiku)' : '⚪ 未配置 (#2 agent 跳过)'}\n` +
-    `自动 Claim: ${CONFIG.AUTO_CLAIM_ENABLED ? `🟢 阈值 ${fmtUsd(CONFIG.AUTO_CLAIM_THRESHOLD_USD)}` : '⚪ 已禁用'}\n\n` +
+    `自动 Claim: ${CONFIG.AUTO_CLAIM_ENABLED ? `🟢 阈值 ${fmtUsd(CONFIG.AUTO_CLAIM_THRESHOLD_USD)}` : '⚪ 已禁用'}\n` +
+    `止损: 🚨 -${CONFIG.HARD_SL_PCT}% 硬止损 + ⚠️ -${CONFIG.STOP_LOSS_WARN_PCT}% 软警告 (连续 ${CONFIG.STOP_LOSS_CONSECUTIVE} 次触发)\n` +
+    `智能恢复: ${CONFIG.AUTO_RESUME_ENABLED ? `🟢 ${CONFIG.AUTO_RESUME_MIN}min 后 + 市场状态确认` : '⚪ 已禁用'}\n` +
+    `开仓: ${(CONFIG.POSITION_PCT * 100).toFixed(0)}% × 钱包,单仓上限 ${fmtUsd(CONFIG.MAX_POSITION_USD)},最多 ${CONFIG.MAX_OPEN_POSITIONS} 个并发\n` +
+    `总敞口上限: ${(CONFIG.TOTAL_EXPOSURE_PCT * 100).toFixed(0)}% × 钱包总值\n\n` +
     `下一步:\n` +
     `1. /agents 查看 agent 状态\n` +
     `2. /pnl 查看 PnL 账本\n` +
