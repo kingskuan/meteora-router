@@ -1,7 +1,7 @@
 {
   "name": "meteora-router",
-  "version": "0.9.5",
-  "description": "Meteora DLMM auto rebalance bot - V0.9.5 (rebalance sizing follows POSITION_PCT for real roll-up)",
+  "version": "0.9.6",
+  "description": "Meteora DLMM auto rebalance bot - V0.9.6 (HTML escape for LLM output + plain-text fallback)",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc -p .",

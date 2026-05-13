@@ -369,8 +369,26 @@ async function notify(msg: string) {
       await bot.telegram.sendMessage(CONFIG.TG_OWNER_ID, msg, { parse_mode: 'HTML' });
     } catch (e: any) {
       console.error(`Failed to send TG: ${e.message}`);
+      // V0.9.6: HTML 解析失败时降级为纯文本重发,不让通知丢失
+      if (e.message?.includes("can't parse entities")) {
+        try {
+          const plain = msg.replace(/<\/?[a-zA-Z]+>/g, '').replace(/<code>|<\/code>/g, '');
+          await bot.telegram.sendMessage(CONFIG.TG_OWNER_ID, '[降级] ' + plain);
+        } catch (e2: any) {
+          console.error(`fallback plain text also failed: ${e2.message}`);
+        }
+      }
     }
   }
+}
+
+/**
+ * V0.9.6: HTML 转义 — 用于把 LLM 输出 / 用户输入塞进 HTML parse_mode 消息时
+ * 防止 <3% 这种字符被当成 HTML 标签起始
+ */
+function escapeHtml(s: string): string {
+  if (!s) return '';
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 // ============================================================
@@ -2153,8 +2171,8 @@ bot.command('agents', async (ctx) => {
     `间隔: ${(CONFIG.MARKET_REGIME_INTERVAL_MS / 3600000).toFixed(1)}h\n` +
     `上次: ${fmtAgo(agentState.lastMarketRegimeAt)}\n` +
     `下次: ${fmtNext(agentState.lastMarketRegimeAt, CONFIG.MARKET_REGIME_INTERVAL_MS)}\n` +
-    `当前: ${agentState.lastMarketRegime}\n` +
-    `理由: ${agentState.lastMarketReason}\n\n` +
+    `当前: ${escapeHtml(agentState.lastMarketRegime)}\n` +
+    `理由: ${escapeHtml(agentState.lastMarketReason)}\n\n` +
     `<b>💸 LLM 累计成本</b>: $${agentState.llmCostUsd.toFixed(4)}`;
 
   await ctx.reply(msg, { parse_mode: 'HTML' });
@@ -2829,7 +2847,7 @@ async function runHealthCheckAgent(): Promise<void> {
 
     // 6. 当前市场状态
     if (agentState.lastMarketRegime !== '未知') {
-      info.push(`市场: ${agentState.lastMarketRegime} (${agentState.lastMarketReason})`);
+      info.push(`市场: ${escapeHtml(agentState.lastMarketRegime)} (${escapeHtml(agentState.lastMarketReason)})`);
     }
 
     const header = issues.length > 0 ? '🩺 <b>健康巡检 (有警告)</b>' : '🩺 <b>健康巡检 (一切正常)</b>';
@@ -2937,10 +2955,10 @@ ${ohlcvSummary}
     if (regime !== prevRegime) {
       const emoji = ({ '稳定': '😴', '震荡': '🌊', '趋势': '📈', '高波动': '⚡' } as any)[regime] || '❓';
       await notify(
-        `${emoji} <b>市场状态: ${regime}</b>\n` +
-        `${reason}\n\n` +
-        `(切换自: ${prevRegime})\n` +
-        `${ohlcvSummary}`
+        `${emoji} <b>市场状态: ${escapeHtml(regime)}</b>\n` +
+        `${escapeHtml(reason)}\n\n` +
+        `(切换自: ${escapeHtml(prevRegime)})\n` +
+        `${escapeHtml(ohlcvSummary)}`
       );
     }
   } catch (e: any) {
@@ -3060,7 +3078,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.9.5 (rebalance sizing 跟随 POSITION_PCT,支持真滚仓)\n` +
+    `Version: V0.9.6 (HTML escape + plain-text fallback)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
