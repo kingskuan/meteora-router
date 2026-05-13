@@ -1,10 +1,10 @@
 {
   "name": "meteora-router",
-  "version": "0.9.2",
-  "description": "Meteora DLMM auto rebalance bot - V0.9.2 (stop-loss + sizing + exposure cap + smart auto-resume)",
+  "version": "0.9.3",
+  "description": "Meteora DLMM auto rebalance bot - V0.9.3 (V0.9.2 + ohlcv parse fix)",
   "main": "dist/bot.js",
   "scripts": {
-    "build": "tsc",
+    "build": "tsc -p .",
     "start": "node dist/bot.js",
     "dev": "ts-node bot.ts"
   },

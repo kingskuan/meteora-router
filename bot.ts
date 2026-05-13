@@ -2853,14 +2853,26 @@ async function runMarketRegimeAgent(): Promise<void> {
       const data: any = await r.json();
       const candles = data?.data?.attributes?.ohlcv_list || [];
       if (candles.length >= 12) {
-        const prices = candles.map((c: any[]) => c[4]);
-        const high = Math.max(...prices);
-        const low = Math.min(...prices);
-        const last = prices[0];
-        const first = prices[prices.length - 1];
-        const change = ((last - first) / first) * 100;
-        const range = ((high - low) / low) * 100;
-        ohlcvSummary = `24h: ${first.toFixed(2)} → ${last.toFixed(2)} (${change >= 0 ? '+' : ''}${change.toFixed(2)}%), 区间波动 ${range.toFixed(2)}%`;
+        // V4 修复: 强类型转换 (Gecko 偶尔返回 string),过滤 NaN/0
+        const prices = candles
+          .map((c: any[]) => Number(c[4]))
+          .filter((p: number) => !isNaN(p) && p > 0);
+
+        if (prices.length >= 12) {
+          const high = Math.max(...prices);
+          const low = Math.min(...prices);
+          // Gecko 倒序: [0]=最新, [length-1]=最旧
+          const last = prices[0];
+          const first = prices[prices.length - 1];
+          const change = ((last - first) / first) * 100;
+          const range = ((high - low) / low) * 100;
+          ohlcvSummary = `24h: $${first.toFixed(2)} → $${last.toFixed(2)} (${change >= 0 ? '+' : ''}${change.toFixed(2)}%), 区间波动 ${range.toFixed(2)}% (high $${high.toFixed(2)} / low $${low.toFixed(2)})`;
+        } else {
+          console.warn(`[market-regime] ohlcv 有效数据不够: ${prices.length}/24`);
+          ohlcvSummary = `OHLCV 数据异常,当前 SOL: $${solPrice.toFixed(2)}`;
+        }
+      } else {
+        console.warn(`[market-regime] candles 不足: ${candles.length}/24`);
       }
     } catch (e: any) {
       console.error(`[market-regime] ohlcv: ${e.message}`);
@@ -3028,7 +3040,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.9.2 (stop-loss + sizing + exposure cap + smart auto-resume)\n` +
+    `Version: V0.9.3 (V0.9.2 + ohlcv parse fix)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
