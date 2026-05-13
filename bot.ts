@@ -3075,10 +3075,33 @@ async function start() {
   });
   console.log('🤖 TG bot launched');
 
+  // V0.9.7: 注册 Telegram menu bar (左下蓝色斜杠按钮)
+  try {
+    await bot.telegram.setMyCommands([
+      { command: 'status', description: '整体状态' },
+      { command: 'positions', description: '所有仓位详情' },
+      { command: 'pnl', description: 'PnL 账本' },
+      { command: 'agents', description: 'Agent 运行状态' },
+      { command: 'now', description: '立即触发自动决策' },
+      { command: 'auto', description: 'auto on/off' },
+      { command: 'pause', description: '暂停所有自动动作' },
+      { command: 'resume', description: '恢复' },
+      { command: 'discover', description: '抓 top 池子加入候选' },
+      { command: 'scan', description: '扫候选池打分' },
+      { command: 'close', description: '手动关仓 <position_pk>' },
+      { command: 'open', description: '手动开仓 <addr> <amount_usd>' },
+      { command: 'emergency', description: '紧急平所有仓' },
+      { command: 'help', description: '查看所有命令' },
+    ]);
+    console.log('[bot] commands menu registered');
+  } catch (e: any) {
+    console.error(`setMyCommands failed: ${e.message}`);
+  }
+
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.9.6 (HTML escape + plain-text fallback)\n` +
+    `Version: V0.9.7 (menu bar + HTML escape)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +

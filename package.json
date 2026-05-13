@@ -1,7 +1,7 @@
 {
   "name": "meteora-router",
-  "version": "0.9.6",
-  "description": "Meteora DLMM auto rebalance bot - V0.9.6 (HTML escape for LLM output + plain-text fallback)",
+  "version": "0.9.7",
+  "description": "Meteora DLMM auto rebalance bot - V0.9.7 (menu bar + HTML escape)",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc -p .",
