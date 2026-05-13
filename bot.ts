@@ -1838,20 +1838,41 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
       console.warn(`[rebalance] WARNING: 快照差值异常 ${fmtUsd(positionRecoveredUsd)}, 回退使用 originalValueUsd=${fmtUsd(originalValueUsd)}`);
     }
 
-    // 安全边界 (V0.9.5):
-    // - 上限: min(钱包总值 × POSITION_PCT, MAX_POSITION_USD)
-    //   跟 tickAutoOpen 的 sizing 一致 — 修改 POSITION_PCT 立即生效,支持滚仓
-    //   (V2-V0.9.4 时代是 originalValueUsd × 1.1,但 TOTAL_EXPOSURE_PCT 已经兜底,1.1× 限制过时)
-    // - 下限: MIN_REBALANCE_USD
-    // V0.9.5 sanity guard: 若 actualUsd 异常大于 originalValueUsd 50%+,警告日志
+    // 安全边界 (V0.9.8 - 真滚仓):
+    // - 目标重建金额: upperBound = min(钱包总值 × POSITION_PCT, MAX_POSITION_USD)
+    // - 实际可用: 钱包总值 × 0.95 (留 5% buffer 给 gas + 价格波动)
+    // - 总敞口检查: 已开仓位 + 新仓 ≤ TOTAL_EXPOSURE_PCT × 钱包总值
+    //
+    // V0.9.5 之前的 bug: reopenAmount = min(actualUsd, upperBound)
+    //   actualUsd 是仓位解出的钱 (~$160),永远 ≤ upperBound,upperBound 形同虚设
+    //   导致仓位规模"卡死"在初始值,无法真滚仓
     if (actualUsd > originalValueUsd * 1.5) {
-      console.warn(`[rebalance] sanity: actualUsd ${fmtUsd(actualUsd)} > 原始值 ${fmtUsd(originalValueUsd)} × 1.5,但仍按 POSITION_PCT 重建`);
+      console.warn(`[rebalance] sanity: actualUsd ${fmtUsd(actualUsd)} > 原始值 ${fmtUsd(originalValueUsd)} × 1.5`);
     }
-    // 钱包总值用 getWalletSnapshot 全量(SOL+USDC+USDT),跟 tickAutoOpen 一致
     const walletSnap = await getWalletSnapshot();
     const walletTotalForSizing = walletSnap.totalUsableUsd;
     const upperBound = Math.min(walletTotalForSizing * CONFIG.POSITION_PCT, CONFIG.MAX_POSITION_USD);
-    const reopenAmount = Math.min(actualUsd, upperBound);
+    const walletAvailable = walletTotalForSizing * 0.95; // 留 5% gas buffer
+
+    // V0.9.8: 总敞口检查 (考虑其他 open 仓位)
+    let otherOpenExposure = 0;
+    try {
+      const otherPositions = await getUserPositions();
+      for (const op of otherPositions) {
+        if (op.positionPk === p.positionPk) continue; // 排除正在 rebalance 的自己(已关闭)
+        const { totalUsd: opUsd, feeUsd: opFee } = await estimatePositionValueUsd(op);
+        otherOpenExposure += opUsd + opFee;
+      }
+    } catch (e: any) {
+      console.error(`[rebalance] other-position exposure check failed: ${e.message}`);
+    }
+    const totalExposureCap = walletTotalForSizing * CONFIG.TOTAL_EXPOSURE_PCT;
+    const exposureRemaining = Math.max(0, totalExposureCap - otherOpenExposure);
+
+    // 最终目标 = 4 个 cap 的最小值
+    const reopenAmount = Math.min(upperBound, walletAvailable, exposureRemaining);
+
+    console.log(`[rebalance] sizing: upperBound=${upperBound.toFixed(2)} walletAvail=${walletAvailable.toFixed(2)} exposureLeft=${exposureRemaining.toFixed(2)} → ${reopenAmount.toFixed(2)}`);
 
     if (reopenAmount < CONFIG.MIN_REBALANCE_USD) {
       throw new Error(
@@ -1864,11 +1885,13 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
     const ilPct = originalValueUsd > 0 ? (ilDiff / originalValueUsd) * 100 : 0;
     // 显示 sizing 来源
     let sizingNote = '';
-    if (reopenAmount === actualUsd) {
-      sizingNote = ' (= 仓位解出)';
-    } else if (reopenAmount === CONFIG.MAX_POSITION_USD) {
+    if (reopenAmount === CONFIG.MAX_POSITION_USD) {
       sizingNote = ` (MAX_POSITION 卡)`;
-    } else if (Math.abs(reopenAmount - walletTotalForSizing * CONFIG.POSITION_PCT) < 0.01) {
+    } else if (Math.abs(reopenAmount - walletAvailable) < 0.01) {
+      sizingNote = ` (钱包 95% 取尽)`;
+    } else if (Math.abs(reopenAmount - exposureRemaining) < 0.01) {
+      sizingNote = ` (总敞口 cap)`;
+    } else if (Math.abs(reopenAmount - upperBound) < 0.01) {
       sizingNote = ` (= 钱包 ${fmtUsd(walletTotalForSizing)} × ${(CONFIG.POSITION_PCT * 100).toFixed(0)}%)`;
     }
     await notify(
@@ -3101,7 +3124,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.9.7 (menu bar + HTML escape)\n` +
+    `Version: V0.9.8 (真滚仓 — reopenAmount 不再被 actualUsd 卡死)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
