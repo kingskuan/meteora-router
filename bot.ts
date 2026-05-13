@@ -1820,10 +1820,19 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
       console.warn(`[rebalance] WARNING: 快照差值异常 ${fmtUsd(positionRecoveredUsd)}, 回退使用 originalValueUsd=${fmtUsd(originalValueUsd)}`);
     }
 
-    // 安全边界:
-    // - 上限: min(原始值 × 1.1, MAX_POSITION_USD) — 防止吞噬钱包其他来源资金
-    // - 下限: MIN_REBALANCE_USD — 太小没意义,gas 都赚不回
-    const upperBound = Math.min(originalValueUsd * 1.1, CONFIG.MAX_POSITION_USD);
+    // 安全边界 (V0.9.5):
+    // - 上限: min(钱包总值 × POSITION_PCT, MAX_POSITION_USD)
+    //   跟 tickAutoOpen 的 sizing 一致 — 修改 POSITION_PCT 立即生效,支持滚仓
+    //   (V2-V0.9.4 时代是 originalValueUsd × 1.1,但 TOTAL_EXPOSURE_PCT 已经兜底,1.1× 限制过时)
+    // - 下限: MIN_REBALANCE_USD
+    // V0.9.5 sanity guard: 若 actualUsd 异常大于 originalValueUsd 50%+,警告日志
+    if (actualUsd > originalValueUsd * 1.5) {
+      console.warn(`[rebalance] sanity: actualUsd ${fmtUsd(actualUsd)} > 原始值 ${fmtUsd(originalValueUsd)} × 1.5,但仍按 POSITION_PCT 重建`);
+    }
+    // 钱包总值用 getWalletSnapshot 全量(SOL+USDC+USDT),跟 tickAutoOpen 一致
+    const walletSnap = await getWalletSnapshot();
+    const walletTotalForSizing = walletSnap.totalUsableUsd;
+    const upperBound = Math.min(walletTotalForSizing * CONFIG.POSITION_PCT, CONFIG.MAX_POSITION_USD);
     const reopenAmount = Math.min(actualUsd, upperBound);
 
     if (reopenAmount < CONFIG.MIN_REBALANCE_USD) {
@@ -1835,10 +1844,19 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
     // IL 报告(基于真实仓位差值)
     const ilDiff = actualUsd - originalValueUsd;
     const ilPct = originalValueUsd > 0 ? (ilDiff / originalValueUsd) * 100 : 0;
+    // 显示 sizing 来源
+    let sizingNote = '';
+    if (reopenAmount === actualUsd) {
+      sizingNote = ' (= 仓位解出)';
+    } else if (reopenAmount === CONFIG.MAX_POSITION_USD) {
+      sizingNote = ` (MAX_POSITION 卡)`;
+    } else if (Math.abs(reopenAmount - walletTotalForSizing * CONFIG.POSITION_PCT) < 0.01) {
+      sizingNote = ` (= 钱包 ${fmtUsd(walletTotalForSizing)} × ${(CONFIG.POSITION_PCT * 100).toFixed(0)}%)`;
+    }
     await notify(
       `📊 <b>仓位实际解出</b>: ${fmtUsd(actualUsd)}\n` +
       `(原 ${fmtUsd(originalValueUsd)}, IL ${ilPct >= 0 ? '+' : ''}${ilPct.toFixed(2)}%)\n` +
-      `重建金额: ${fmtUsd(reopenAmount)}`
+      `重建金额: ${fmtUsd(reopenAmount)}${sizingNote}`
     );
 
     // V3: 写入 PnL 账本(rebalance close 也是 close,记一行)
@@ -2866,7 +2884,9 @@ async function runMarketRegimeAgent(): Promise<void> {
           const first = prices[prices.length - 1];
           const change = ((last - first) / first) * 100;
           const range = ((high - low) / low) * 100;
-          ohlcvSummary = `24h: $${first.toFixed(2)} → $${last.toFixed(2)} (${change >= 0 ? '+' : ''}${change.toFixed(2)}%), 区间波动 ${range.toFixed(2)}% (high $${high.toFixed(2)} / low $${low.toFixed(2)})`;
+          // V0.9.4: 自适应小数位 (Gecko 池子可能返回 USDC/SOL 反向价格如 0.0104,需要 4-6 位)
+          const dp = Math.max(high, last) < 1 ? 6 : 2;
+          ohlcvSummary = `24h: $${first.toFixed(dp)} → $${last.toFixed(dp)} (${change >= 0 ? '+' : ''}${change.toFixed(2)}%), 区间波动 ${range.toFixed(2)}% (high $${high.toFixed(dp)} / low $${low.toFixed(dp)})`;
         } else {
           console.warn(`[market-regime] ohlcv 有效数据不够: ${prices.length}/24`);
           ohlcvSummary = `OHLCV 数据异常,当前 SOL: $${solPrice.toFixed(2)}`;
@@ -3040,7 +3060,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.9.3 (V0.9.2 + ohlcv parse fix)\n` +
+    `Version: V0.9.5 (rebalance sizing 跟随 POSITION_PCT,支持真滚仓)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
