@@ -2460,7 +2460,10 @@ bot.command('pnl', async (ctx) => {
           `  日均收益率: ${dailyReturnPct >= 0 ? '+' : ''}${dailyReturnPct.toFixed(2)}% / 天\n` +
           `  线性年化 (外推): <b>${linearApr.toFixed(0)}%</b>\n`;
         if (spanDays < 30 || grandTrades < 30) {
-          msg += `  ⚠️ <i>样本不足 ${spanDays < 30 ? `(${spanDays.toFixed(1)}天<30)` : ''} ${grandTrades < 30 ? `(${grandTrades}笔<30)` : ''} 数字仅供参考</i>\n`;
+          const issues = [];
+          if (spanDays < 30) issues.push(`仅 ${spanDays.toFixed(1)}天 (未满30天)`);
+          if (grandTrades < 30) issues.push(`仅 ${grandTrades}笔 (未满30笔)`);
+          msg += `  ⚠️ <i>样本不足: ${issues.join('、')},数字仅供参考</i>\n`;
         }
         msg += `\n`;
       } catch (e: any) {
@@ -3323,7 +3326,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.10.1 (PnL 性能指标改老实版)\n` +
+    `Version: V0.10.2 (修 disclaimer 里 &lt; 符号又把 HTML 干坏了)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
