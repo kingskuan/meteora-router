@@ -75,7 +75,7 @@ const CONFIG = {
   PRIORITY_FEE_MICRO_LAMPORTS: 100_000,
   TX_MAX_RETRIES: 3,
   SWAP_SLIPPAGE_BPS: 100,                   // 池内 swap minOutAmount 滑点保护(1%)
-  SWAP_MAX_IMPACT_PCT: 3.0,                 // 池内 swap priceImpact 放弃门槛(超过则 fallback Jupiter)
+  SWAP_MAX_IMPACT_PCT: parseFloat(process.env.SWAP_MAX_IMPACT_PCT || '5'),  // V0.10.4: 默认 3→5,env 可调
   PREFER_JUPITER: false,                    // true: 直接走 Jupiter; false: 先池内试探,失败再 fallback
   JUPITER_SLIPPAGE_BPS: 100,                // Jupiter swap 滑点(1%)
 
@@ -100,7 +100,7 @@ const CONFIG = {
     'https://dlmm-api.meteora.ag',
   ],
   GECKOTERMINAL_API: 'https://api.geckoterminal.com/api/v2',
-  JUP_API: 'https://quote-api.jup.ag/v6',
+  JUP_API: process.env.JUP_API || 'https://lite-api.jup.ag/swap/v1',  // V0.10.4: v6 已 deprecated (Sep 2025) → 迁移 lite-api
 
   PORT: parseInt(process.env.PORT || '3000'),
 };
@@ -3349,7 +3349,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.10.3 (死锁救援: close ✅ 但 reopen ❌ 时强制扫池开新仓)\n` +
+    `Version: V0.10.4 (Jupiter v6 → lite-api 迁移 + SWAP_MAX_IMPACT 默认 5%)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
