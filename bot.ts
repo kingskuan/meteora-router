@@ -317,6 +317,15 @@ async function initDb() {
       closed_at TIMESTAMPTZ DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_pnl_pair ON pnl_history(pair_name, closed_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_pnl_closed ON pnl_history(closed_at DESC);
+
+    -- V0.10: 账户维度 baseline (用户手动设定的初始本金)
+    CREATE TABLE IF NOT EXISTS account_settings (
+      key TEXT PRIMARY KEY,
+      value NUMERIC(18,4),
+      updated_at TIMESTAMPTZ DEFAULT NOW(),
+      note TEXT
+    );
   `);
   // seed default candidates
   for (const addr of CANDIDATE_POOLS_DEFAULT) {
@@ -2365,28 +2374,130 @@ bot.command('pnl', async (ctx) => {
       return;
     }
 
-    let grandPnl = 0, grandTrades = 0, grandWins = 0;
+    let grandPnl = 0, grandTrades = 0, grandWins = 0, grandHoldMin = 0, grandOpen = 0;
+    for (const row of aggR.rows) {
+      grandPnl += parseFloat(row.total_pnl);
+      grandTrades += parseInt(row.cnt);
+      grandWins += parseInt(row.wins);
+      grandHoldMin += parseInt(row.total_hold_minutes);
+      grandOpen += parseFloat(row.total_open);
+    }
+
     let msg = `<b>📊 累计 PnL 账本</b>\n(V0.6.3 起的 close 记录)\n\n`;
+
+    // ========== V0.10: 账户维度 (Baseline) ==========
+    try {
+      const blR = await db.query<{ value: string; updated_at: Date; note: string }>(
+        `SELECT value, updated_at, note FROM account_settings WHERE key = 'baseline_usd'`
+      );
+      if (blR.rows.length > 0) {
+        const baseline = parseFloat(blR.rows[0].value);
+        const blDate = new Date(blR.rows[0].updated_at).toISOString().slice(0, 10);
+        // 计算当前账户总值 (钱包 + open 仓位市值)
+        const walletSnap = await getWalletSnapshot();
+        let openExposureUsd = 0;
+        try {
+          const ops = await getUserPositions();
+          for (const op of ops) {
+            const v = await estimatePositionValueUsd(op);
+            openExposureUsd += v.totalUsd + v.feeUsd;
+          }
+        } catch {}
+        const currentTotalUsd = walletSnap.totalUsableUsd + openExposureUsd;
+        const accountPnl = currentTotalUsd - baseline;
+        const accountPnlPct = baseline > 0 ? (accountPnl / baseline) * 100 : 0;
+        const tag = accountPnl >= 0 ? '🟢' : '🔴';
+        msg += `<b>💼 账户维度</b>\n` +
+          `  Baseline: ${fmtUsd(baseline)} (${blDate})\n` +
+          `  当前总值: ${fmtUsd(currentTotalUsd)} (钱包 ${fmtUsd(walletSnap.totalUsableUsd)} + 仓位 ${fmtUsd(openExposureUsd)})\n` +
+          `  ${tag} 账户盈亏: ${accountPnl >= 0 ? '+' : ''}${fmtUsd(accountPnl)} (${accountPnlPct >= 0 ? '+' : ''}${accountPnlPct.toFixed(2)}%)\n\n`;
+      } else {
+        msg += `<i>💡 还没设 baseline,发 /setbaseline &lt;USD&gt; 启用账户维度盈亏</i>\n\n`;
+      }
+    } catch (e: any) {
+      console.error(`[pnl] baseline check: ${e.message}`);
+    }
+
+    // ========== 仓位维度 (现有逻辑) ==========
+    msg += `<b>📈 仓位维度 (按对)</b>\n`;
     for (const row of aggR.rows) {
       const cnt = parseInt(row.cnt);
       const pnl = parseFloat(row.total_pnl);
       const avgPct = parseFloat(row.avg_pnl_pct);
       const wins = parseInt(row.wins);
       const wr = cnt > 0 ? (wins / cnt) * 100 : 0;
-      const totalHoldH = (parseInt(row.total_hold_minutes) / 60).toFixed(1);
+      const holdH = parseInt(row.total_hold_minutes) / 60;
+      const avgHoldH = cnt > 0 ? holdH / cnt : 0;
       const tag = pnl >= 0 ? '🟢' : '🔴';
       msg += `${tag} <b>${row.pair_name}</b>\n` +
-        `  ${cnt} 次 close · 累计 ${pnl >= 0 ? '+' : ''}${fmtUsd(pnl)}\n` +
-        `  平均 ${avgPct >= 0 ? '+' : ''}${avgPct.toFixed(2)}% · WR ${wr.toFixed(0)}% (${wins}/${cnt})\n` +
-        `  持仓 ${totalHoldH}h\n\n`;
-      grandPnl += pnl;
-      grandTrades += cnt;
-      grandWins += wins;
+        `  ${cnt} 次 · 累计 ${pnl >= 0 ? '+' : ''}${fmtUsd(pnl)} · 平均 ${avgPct >= 0 ? '+' : ''}${avgPct.toFixed(2)}%\n` +
+        `  WR ${wr.toFixed(0)}% (${wins}/${cnt}) · 平均持仓 ${avgHoldH.toFixed(1)}h\n\n`;
     }
     const grandWr = grandTrades > 0 ? (grandWins / grandTrades) * 100 : 0;
-    msg += `─────────────\n<b>合计</b>: ${grandPnl >= 0 ? '+' : ''}${fmtUsd(grandPnl)} · ${grandTrades} trades · WR ${grandWr.toFixed(0)}%\n\n`;
+    const grandHoldH = grandHoldMin / 60;
+    const avgPositionSize = grandTrades > 0 ? grandOpen / grandTrades : 0;
+    msg += `─────────────\n` +
+      `<b>合计</b>: ${grandPnl >= 0 ? '+' : ''}${fmtUsd(grandPnl)} · ${grandTrades} trades · WR ${grandWr.toFixed(0)}%\n` +
+      `总持仓: ${grandHoldH.toFixed(1)}h · 平均仓位 ${fmtUsd(avgPositionSize)}\n`;
 
-    // 最近 5 笔
+    // ========== V0.10: APR 估算 ==========
+    if (avgPositionSize > 0 && grandHoldH > 0) {
+      // APR = (累计 PnL / 平均仓位) × (8760 / 持仓时长) × 100%
+      const apr = (grandPnl / avgPositionSize) * (8760 / grandHoldH) * 100;
+      msg += `年化 APR (估算): <b>${apr.toFixed(1)}%</b> <i>(基于实际持仓时长,非复利)</i>\n`;
+    }
+    msg += `LLM 累计成本: $${agentState.llmCostUsd.toFixed(4)}\n\n`;
+
+    // ========== V0.10: 分段 PnL (24h / 7d / 30d) ==========
+    try {
+      const segR = await db.query<{
+        seg: string; cnt: string; total: string;
+      }>(`
+        SELECT '24h' as seg, COUNT(*) as cnt, COALESCE(SUM(pnl_usd), 0) as total FROM pnl_history WHERE closed_at > NOW() - INTERVAL '24 hours'
+        UNION ALL
+        SELECT '7d', COUNT(*), COALESCE(SUM(pnl_usd), 0) FROM pnl_history WHERE closed_at > NOW() - INTERVAL '7 days'
+        UNION ALL
+        SELECT '30d', COUNT(*), COALESCE(SUM(pnl_usd), 0) FROM pnl_history WHERE closed_at > NOW() - INTERVAL '30 days'
+      `);
+      msg += `<b>📅 分段</b>\n`;
+      for (const r of segR.rows) {
+        const cnt = parseInt(r.cnt);
+        const total = parseFloat(r.total);
+        const tag = total >= 0 ? '🟢' : (total < 0 ? '🔴' : '⚪');
+        msg += `  ${r.seg.padEnd(4)} ${tag} ${total >= 0 ? '+' : ''}${fmtUsd(total)} (${cnt} trades)\n`;
+      }
+      msg += `\n`;
+    } catch (e: any) {
+      console.error(`[pnl] segment query: ${e.message}`);
+    }
+
+    // ========== V0.10: 最佳 / 最差 ==========
+    try {
+      const bestR = await db.query<{
+        pair_name: string; pnl_usd: string; pnl_pct: string; closed_at: Date;
+      }>(`SELECT pair_name, pnl_usd, pnl_pct, closed_at FROM pnl_history ORDER BY pnl_usd DESC LIMIT 1`);
+      const worstR = await db.query<{
+        pair_name: string; pnl_usd: string; pnl_pct: string; closed_at: Date;
+      }>(`SELECT pair_name, pnl_usd, pnl_pct, closed_at FROM pnl_history ORDER BY pnl_usd ASC LIMIT 1`);
+      if (bestR.rows.length > 0 && worstR.rows.length > 0) {
+        const fmt = (r: any) => {
+          const p = parseFloat(r.pnl_usd);
+          const pp = parseFloat(r.pnl_pct);
+          const dt = new Date(r.closed_at).toISOString().slice(5, 16).replace('T', ' ');
+          return `${p >= 0 ? '+' : ''}${fmtUsd(p)} (${pp >= 0 ? '+' : ''}${pp.toFixed(1)}%) ${r.pair_name} @ ${dt}`;
+        };
+        msg += `<b>🏆 极值</b>\n`;
+        msg += `  🏆 最佳: ${fmt(bestR.rows[0])}\n`;
+        if (bestR.rows[0].closed_at.toString() !== worstR.rows[0].closed_at.toString()) {
+          msg += `  💩 最差: ${fmt(worstR.rows[0])}\n`;
+        }
+        msg += `\n`;
+      }
+    } catch (e: any) {
+      console.error(`[pnl] best/worst: ${e.message}`);
+    }
+
+    // ========== 最近 5 笔 ==========
     const recentR = await db.query<{
       pair_name: string;
       pnl_usd: string;
@@ -2396,7 +2507,7 @@ bot.command('pnl', async (ctx) => {
       closed_at: Date;
     }>(`SELECT pair_name, pnl_usd, pnl_pct, reason, hold_minutes, closed_at FROM pnl_history ORDER BY closed_at DESC LIMIT 5`);
 
-    msg += `<b>最近 5 笔</b>\n`;
+    msg += `<b>📜 最近 5 笔</b>\n`;
     for (const row of recentR.rows) {
       const pnl = parseFloat(row.pnl_usd);
       const pnlPct = parseFloat(row.pnl_pct);
@@ -2405,6 +2516,72 @@ bot.command('pnl', async (ctx) => {
       msg += `${tag} ${dt} ${row.pair_name} ${pnl >= 0 ? '+' : ''}${fmtUsd(pnl)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(1)}%) ${row.reason}\n`;
     }
     await ctx.reply(msg, { parse_mode: 'HTML' });
+  } catch (e: any) {
+    await ctx.reply(`❌ ${e.message}`);
+  }
+});
+
+// V0.10: /setbaseline 命令 - 设置账户维度起始本金
+bot.command('setbaseline', async (ctx) => {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  try {
+    if (args.length === 0) {
+      // 查询当前 baseline
+      const r = await db.query<{ value: string; updated_at: Date; note: string }>(
+        `SELECT value, updated_at, note FROM account_settings WHERE key = 'baseline_usd'`
+      );
+      if (r.rows.length === 0) {
+        // 自动用当前账户总值作为建议
+        const walletSnap = await getWalletSnapshot();
+        let openExposureUsd = 0;
+        try {
+          const ops = await getUserPositions();
+          for (const op of ops) {
+            const v = await estimatePositionValueUsd(op);
+            openExposureUsd += v.totalUsd + v.feeUsd;
+          }
+        } catch {}
+        const currentTotal = walletSnap.totalUsableUsd + openExposureUsd;
+        await ctx.reply(
+          `💡 <b>Baseline 未设</b>\n\n` +
+          `当前账户总值: <b>${fmtUsd(currentTotal)}</b>\n` +
+          `钱包闲钱: ${fmtUsd(walletSnap.totalUsableUsd)}\n` +
+          `仓位市值: ${fmtUsd(openExposureUsd)}\n\n` +
+          `用法: <code>/setbaseline ${currentTotal.toFixed(2)}</code> (用当前总值)\n` +
+          `或: <code>/setbaseline 500</code> (自定义起始本金)\n\n` +
+          `<i>设定后 /pnl 会显示账户维度盈亏。后续如有充值/提现,记得手动更新 baseline。</i>`,
+          { parse_mode: 'HTML' }
+        );
+        return;
+      }
+      const baseline = parseFloat(r.rows[0].value);
+      const blDate = new Date(r.rows[0].updated_at).toISOString().slice(0, 16).replace('T', ' ');
+      await ctx.reply(
+        `💼 <b>当前 Baseline</b>: ${fmtUsd(baseline)}\n` +
+        `设定时间: ${blDate}\n\n` +
+        `<i>更新:</i> <code>/setbaseline &lt;新金额&gt;</code>`,
+        { parse_mode: 'HTML' }
+      );
+      return;
+    }
+
+    const newBaseline = parseFloat(args[0]);
+    if (isNaN(newBaseline) || newBaseline <= 0) {
+      await ctx.reply('❌ 金额无效。用法: <code>/setbaseline 500</code>', { parse_mode: 'HTML' });
+      return;
+    }
+
+    await db.query(
+      `INSERT INTO account_settings(key, value, updated_at) VALUES('baseline_usd', $1, NOW())
+       ON CONFLICT(key) DO UPDATE SET value = $1, updated_at = NOW()`,
+      [newBaseline]
+    );
+    await ctx.reply(
+      `✅ <b>Baseline 已设</b>: ${fmtUsd(newBaseline)}\n\n` +
+      `发 /pnl 查看账户维度盈亏。`,
+      { parse_mode: 'HTML' }
+    );
+    await logEvent('setbaseline', { value: newBaseline });
   } catch (e: any) {
     await ctx.reply(`❌ ${e.message}`);
   }
@@ -3104,6 +3281,7 @@ async function start() {
       { command: 'status', description: '整体状态' },
       { command: 'positions', description: '所有仓位详情' },
       { command: 'pnl', description: 'PnL 账本' },
+      { command: 'setbaseline', description: '设置账户起始本金' },
       { command: 'agents', description: 'Agent 运行状态' },
       { command: 'now', description: '立即触发自动决策' },
       { command: 'auto', description: 'auto on/off' },
@@ -3124,7 +3302,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.9.8 (真滚仓 — reopenAmount 不再被 actualUsd 卡死)\n` +
+    `Version: V0.10 (PnL 富信息 + 账户 baseline)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
