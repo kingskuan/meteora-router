@@ -1,7 +1,7 @@
 {
   "name": "meteora-router",
-  "version": "0.10.0",
-  "description": "Meteora DLMM auto rebalance bot - V0.10 (PnL rich info + account baseline)",
+  "version": "0.10.1",
+  "description": "Meteora DLMM auto rebalance bot - V0.10.1 (honest performance metrics + sample size warnings)",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc -p .",

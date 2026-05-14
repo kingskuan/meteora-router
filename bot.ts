@@ -2438,13 +2438,34 @@ bot.command('pnl', async (ctx) => {
     const avgPositionSize = grandTrades > 0 ? grandOpen / grandTrades : 0;
     msg += `─────────────\n` +
       `<b>合计</b>: ${grandPnl >= 0 ? '+' : ''}${fmtUsd(grandPnl)} · ${grandTrades} trades · WR ${grandWr.toFixed(0)}%\n` +
-      `总持仓: ${grandHoldH.toFixed(1)}h · 平均仓位 ${fmtUsd(avgPositionSize)}\n`;
+      `总持仓: ${grandHoldH.toFixed(1)}h · 平均仓位 ${fmtUsd(avgPositionSize)}\n\n`;
 
-    // ========== V0.10: APR 估算 ==========
+    // ========== V0.10.1: 性能指标 (B+C 混合 - 老实数据 + 警告) ==========
     if (avgPositionSize > 0 && grandHoldH > 0) {
-      // APR = (累计 PnL / 平均仓位) × (8760 / 持仓时长) × 100%
-      const apr = (grandPnl / avgPositionSize) * (8760 / grandHoldH) * 100;
-      msg += `年化 APR (估算): <b>${apr.toFixed(1)}%</b> <i>(基于实际持仓时长,非复利)</i>\n`;
+      // 实际跨度: 从第一笔到现在
+      try {
+        const spanR = await db.query<{ first_close: Date }>(
+          `SELECT MIN(closed_at) as first_close FROM pnl_history`
+        );
+        const firstClose = spanR.rows[0]?.first_close;
+        const spanDays = firstClose ? (Date.now() - new Date(firstClose).getTime()) / 86400000 : 0;
+
+        const periodReturnPct = avgPositionSize > 0 ? (grandPnl / avgPositionSize) * 100 : 0;
+        const dailyReturnPct = spanDays > 0 ? periodReturnPct / spanDays : 0;
+        const linearApr = (grandPnl / avgPositionSize) * (8760 / grandHoldH) * 100;
+
+        msg += `<b>📊 性能指标</b>\n` +
+          `  跨度: ${spanDays.toFixed(1)} 天 · ${grandTrades} trades\n` +
+          `  累计期收益: ${periodReturnPct >= 0 ? '+' : ''}${periodReturnPct.toFixed(2)}% (PnL / 平均仓位)\n` +
+          `  日均收益率: ${dailyReturnPct >= 0 ? '+' : ''}${dailyReturnPct.toFixed(2)}% / 天\n` +
+          `  线性年化 (外推): <b>${linearApr.toFixed(0)}%</b>\n`;
+        if (spanDays < 30 || grandTrades < 30) {
+          msg += `  ⚠️ <i>样本不足 ${spanDays < 30 ? `(${spanDays.toFixed(1)}天<30)` : ''} ${grandTrades < 30 ? `(${grandTrades}笔<30)` : ''} 数字仅供参考</i>\n`;
+        }
+        msg += `\n`;
+      } catch (e: any) {
+        console.error(`[pnl] performance metrics: ${e.message}`);
+      }
     }
     msg += `LLM 累计成本: $${agentState.llmCostUsd.toFixed(4)}\n\n`;
 
@@ -3302,7 +3323,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.10 (PnL 富信息 + 账户 baseline)\n` +
+    `Version: V0.10.1 (PnL 性能指标改老实版)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
