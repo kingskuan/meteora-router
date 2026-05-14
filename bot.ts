@@ -1811,6 +1811,10 @@ async function getHoldMinutes(positionPk: string): Promise<number> {
 async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
   const lbPair = p.lbPair;
 
+  // V0.10.3: 死锁救援 flag - close 成功后置 true,catch 检测到这个 flag 就强制扫池开新仓
+  // 解决场景: close ✅ → openPosition ❌ → 钱包闲置 + tickAutoOpen 受 30min 缓存锁 → 死锁
+  let positionClosed = false;
+
   // V2.3: rebalance 进行中,tickAutoOpen 跳过(防双开)
   state.rebalancing = true;
   await notify(`🔄 <b>Rebalance ${p.pairName}</b>`);
@@ -1835,6 +1839,10 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
 
     await closePosition(p.positionPk, 'rebalance');
     await sleep(3000); // 等链上结算
+
+    // V0.10.3: 仓位已关闭(包括 closePosition 内部返回 'NOT_FOUND' 也算空仓状态)
+    // 之后任何步骤(snapshot/sizing/openPosition)失败 → 死锁 → catch 触发救援
+    positionClosed = true;
 
     const afterUsd = await snapshotPairUsd(xMint, yMint, xDec, yDec);
     console.log(`[rebalance] after close: wallet ${tokenSymbol(xMint)}+${tokenSymbol(yMint)} = ${fmtUsd(afterUsd)}`);
@@ -1945,6 +1953,21 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
         `不暂停 bot,${CONFIG.REBALANCE_COOLDOWN_MS / 60000} 分钟 cooldown 后下个 tick 自动重试`
       );
       // 不 paused, 等 cooldown 过后自然重试
+    }
+
+    // V0.10.3: 死锁救援
+    // 仓位已关闭但 reopen 失败 → tickPositions 没仓位可监测 + tickAutoOpen 受 SCAN_INTERVAL_MS 锁 → 死锁
+    // 清 lastScanTs 强制下个 tick (~2分钟) 触发自动扫池开新仓
+    // paused 场景下也清(无副作用,等智能恢复 /resume 后立刻扫)
+    if (positionClosed) {
+      state.lastScanTs = 0;
+      await notify(
+        `🔓 <b>死锁救援已启动</b>\n` +
+        `仓位已关闭但重建失败 → 已清扫描缓存\n` +
+        (state.paused
+          ? `智能恢复 /resume 后将立刻扫池开新仓`
+          : `下个 tick (~2 分钟) 内将自动尝试开新仓`)
+      );
     }
   } finally {
     // V2.3: 无论成功失败都释放标志位
@@ -3326,7 +3349,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.10.2 (修 disclaimer 里 &lt; 符号又把 HTML 干坏了)\n` +
+    `Version: V0.10.3 (死锁救援: close ✅ 但 reopen ❌ 时强制扫池开新仓)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
