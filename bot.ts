@@ -51,6 +51,14 @@ const CONFIG = {
   MAX_POSITION_USD: parseFloat(process.env.MAX_POSITION_USD || '200'),
   POOL_COOLDOWN_MINUTES: parseInt(process.env.POOL_COOLDOWN_MINUTES || '60'),
   MAX_OPEN_POSITIONS: parseInt(process.env.MAX_OPEN_POSITIONS || '2'),
+  // V0.11: 混合策略 - 分类型 cap (volatile + stable ≤ MAX_OPEN_POSITIONS)
+  MAX_VOLATILE_POSITIONS: parseInt(process.env.MAX_VOLATILE_POSITIONS || '1'),  // SOL/USDC 等
+  MAX_STABLE_POSITIONS: parseInt(process.env.MAX_STABLE_POSITIONS || '1'),      // USDC/USDT 等
+  STABLE_RANGE_PCT: parseFloat(process.env.STABLE_RANGE_PCT || '0.4'),          // 稳定币池 ±0.2% (=total 0.4)
+  STABLE_TVL_MIN: parseFloat(process.env.STABLE_TVL_MIN || '200000'),           // stable 池硬筛 TVL 下限
+  STABLE_VOL_MIN: parseFloat(process.env.STABLE_VOL_MIN || '30000'),            // stable 池硬筛 24h vol 下限
+  DEPEG_ALERT_PCT: parseFloat(process.env.DEPEG_ALERT_PCT || '0.5'),            // depeg 0.5% 警报
+  DEPEG_AUTO_CLOSE_PCT: parseFloat(process.env.DEPEG_AUTO_CLOSE_PCT || '1.0'),  // depeg 1% 自动关仓 + paused
   HARD_SL_PCT: parseFloat(process.env.HARD_SL_PCT || '10'),                 // V0.9: 默认 -10% 硬止损
   STOP_LOSS_WARN_PCT: parseFloat(process.env.STOP_LOSS_WARN_PCT || '7'),     // V0.9: -7% 软警告
   STOP_LOSS_CONSECUTIVE: parseInt(process.env.STOP_LOSS_CONSECUTIVE || '2'), // V0.9: 连续 N 次触发才执行,防抖
@@ -1015,13 +1023,15 @@ function scorePool(p: PoolInfo): { score: number; reasons: string[] } {
     return { score: -1, reasons };
   }
 
-  // 硬筛 3: TVL / Volume
-  if (!p.tvlUsd || p.tvlUsd < 500_000) {
-    reasons.push(`TVL ${fmtUsd(p.tvlUsd)} < $500k`);
+  // 硬筛 3: TVL / Volume (V0.11: 分 stable/volatile 阈值)
+  const minTvl = isStableStable ? CONFIG.STABLE_TVL_MIN : 500_000;
+  const minVol = isStableStable ? CONFIG.STABLE_VOL_MIN : 200_000;
+  if (!p.tvlUsd || p.tvlUsd < minTvl) {
+    reasons.push(`TVL ${fmtUsd(p.tvlUsd)} < ${fmtUsd(minTvl)} (${isStableStable ? 'stable' : 'volatile'})`);
     return { score: -1, reasons };
   }
-  if (!p.volume24hUsd || p.volume24hUsd < 200_000) {
-    reasons.push(`Vol ${fmtUsd(p.volume24hUsd)} < $200k`);
+  if (!p.volume24hUsd || p.volume24hUsd < minVol) {
+    reasons.push(`Vol ${fmtUsd(p.volume24hUsd)} < ${fmtUsd(minVol)} (${isStableStable ? 'stable' : 'volatile'})`);
     return { score: -1, reasons };
   }
 
@@ -1048,7 +1058,8 @@ function scorePool(p: PoolInfo): { score: number; reasons: string[] } {
   score += volumeScore;
   reasons.push(`volume = +${volumeScore.toFixed(1)}`);
 
-  if (p.tvlUsd < 2_000_000) {
+  // V0.11: TVL penalty 只对 volatile 池生效 (stable 池天然 TVL 不高,不应受罚)
+  if (!isStableStable && p.tvlUsd < 2_000_000) {
     const penalty = (2_000_000 - p.tvlUsd) / 100_000;
     score -= penalty;
     reasons.push(`TVL 偏小 = -${penalty.toFixed(1)}`);
@@ -1385,7 +1396,11 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
   // 关键限制:DLMM SDK V1 single position 最多 70 bins
   // (Solana realloc 上限 10240 bytes,每 bin 数据空间限制)
   // 所以 halfBins 最大 34(总 69 bins,留 1 buffer)
-  const halfPctTarget = CONFIG.RANGE_PCT / 2;
+  //
+  // V0.11: 按 pool 类型选 range (stable 池 ±0.2%, volatile 池 ±5%)
+  const isStableStable = tokenXMint !== SOL_MINT && tokenYMint !== SOL_MINT;
+  const effectiveRangePct = isStableStable ? CONFIG.STABLE_RANGE_PCT : CONFIG.RANGE_PCT;
+  const halfPctTarget = effectiveRangePct / 2;
   let halfRangeBins = Math.max(3, Math.ceil((halfPctTarget * 100) / binStep));
   if (halfRangeBins > 34) halfRangeBins = 34; // SDK V1 单 position 70 bins 上限
   const minBinId = activeBin.binId - halfRangeBins;
@@ -1394,7 +1409,7 @@ async function openPosition(lbPair: string, amountUsd: number): Promise<{ positi
   // 实际 range 百分比(用于日志 + 通知)
   const totalBins = (maxBinId - minBinId + 1);
   const actualRangePct = (Math.pow(1 + binStep / 10000, totalBins) - 1) * 100;
-  console.log(`[openPosition] bin_step=${binStep}, target=±${halfPctTarget}%, halfBins=${halfRangeBins}, total=${totalBins} bins, actualRange=${actualRangePct.toFixed(2)}%`);
+  console.log(`[openPosition] type=${isStableStable ? 'stable' : 'volatile'}, bin_step=${binStep}, target=±${halfPctTarget}%, halfBins=${halfRangeBins}, total=${totalBins} bins, actualRange=${actualRangePct.toFixed(2)}%`);
 
   // 目标 50/50:amountUsd / 2 在 X,amountUsd / 2 在 Y
   const xPrice = await getTokenPriceUsd(tokenXMint);
@@ -1664,6 +1679,8 @@ const rebalanceFailCount = new Map<string, number>();
 // 连续 N 次 tick 都触发硬止损线才真执行,避免单次价格 API 抖动误杀
 const stopLossHitCount = new Map<string, number>();
 const stopLossWarnedSet = new Set<string>(); // 软警告已发送(防刷屏)
+// V0.11: depeg 警报已发送的 position 集合(防刷屏)
+const depegAlertedSet = new Set<string>();
 
 async function tickPositions() {
   const positions = await getUserPositions();
@@ -1727,6 +1744,45 @@ async function tickPositions() {
         // 浮亏未达硬止损线,清计数
         if (stopLossHitCount.has(p.positionPk)) {
           stopLossHitCount.delete(p.positionPk);
+        }
+      }
+
+      // V0.11: Depeg 监控 (只对 stable-stable 池, USDC/USDT 等)
+      // 通过 activePrice 判断价差: stable 池正常 ~1.0, 偏离 >0.5% 警报, >1% 自动关仓
+      const isStablePool = p.tokenXMint !== SOL_MINT && p.tokenYMint !== SOL_MINT;
+      if (isStablePool && p.activePrice > 0) {
+        const depegPct = Math.abs(p.activePrice - 1) * 100;
+        if (depegPct > CONFIG.DEPEG_AUTO_CLOSE_PCT) {
+          await notify(
+            `🚨 <b>${p.pairName} DEPEG 自动关仓</b>\n` +
+            `价格偏离: ${depegPct.toFixed(3)}% > ${CONFIG.DEPEG_AUTO_CLOSE_PCT}%\n` +
+            `当前价: ${p.activePrice.toFixed(5)}\n` +
+            `自动关仓 + 暂停 bot (需手动 /resume)`
+          );
+          try {
+            await closePosition(p.positionPk, 'depeg');
+          } catch (e: any) {
+            await notify(`❌ Depeg 平仓失败: ${e.message}`);
+          }
+          state.paused = true;
+          state.autoResumablePausedAt = 0; // 不自动恢复, depeg 需要人工判断
+          state.autoResumeReason = `Depeg ${depegPct.toFixed(2)}% (${p.pairName})`;
+          depegAlertedSet.delete(p.positionPk);
+          continue;
+        }
+        if (depegPct > CONFIG.DEPEG_ALERT_PCT) {
+          if (!depegAlertedSet.has(p.positionPk)) {
+            await notify(
+              `⚠️ <b>${p.pairName} Depeg 警报</b>\n` +
+              `价格偏离: ${depegPct.toFixed(3)}% > ${CONFIG.DEPEG_ALERT_PCT}%\n` +
+              `当前价: ${p.activePrice.toFixed(5)}\n` +
+              `继续观察, 偏离超过 ${CONFIG.DEPEG_AUTO_CLOSE_PCT}% 将自动关仓`
+            );
+            depegAlertedSet.add(p.positionPk);
+          }
+        } else {
+          // 恢复到警报线之下, 清除标志
+          depegAlertedSet.delete(p.positionPk);
         }
       }
 
@@ -1996,10 +2052,23 @@ async function tickAutoOpen(verbose: boolean = false) {
     return;
   }
 
-  // 已有仓位数
-  const r = await db.query<{ c: string }>(`SELECT COUNT(*) as c FROM positions WHERE status='open'`);
-  const openCount = parseInt(r.rows[0].c);
+  // V0.11: 按类型分别计数 (volatile/stable),并保留总 cap 兜底
+  const openPositionsR = await db.query<{ lb_pair: string }>(`SELECT lb_pair FROM positions WHERE status='open'`);
+  const openCount = openPositionsR.rows.length;
   if (openCount >= CONFIG.MAX_OPEN_POSITIONS) return;
+
+  let openVolatile = 0, openStable = 0;
+  for (const row of openPositionsR.rows) {
+    try {
+      const info = await getPoolInfo(row.lb_pair);
+      const isStable = info.tokenXMint !== SOL_MINT && info.tokenYMint !== SOL_MINT;
+      if (isStable) openStable++; else openVolatile++;
+    } catch {}
+  }
+  if (openVolatile >= CONFIG.MAX_VOLATILE_POSITIONS && openStable >= CONFIG.MAX_STABLE_POSITIONS) {
+    console.log(`[tickAutoOpen] both types full: volatile=${openVolatile}/${CONFIG.MAX_VOLATILE_POSITIONS}, stable=${openStable}/${CONFIG.MAX_STABLE_POSITIONS}`);
+    return;
+  }
 
   // 4h 内已扫过就不重扫
   if (Date.now() - state.lastScanTs < CONFIG.SCAN_INTERVAL_MS) return;
@@ -2051,6 +2120,16 @@ async function tickAutoOpen(verbose: boolean = false) {
     const candidateKey = [candidate.info.tokenXMint, candidate.info.tokenYMint].sort().join('|');
     if (heldPairKeys.has(candidateKey)) {
       skipReasons.push(`${candidate.info.pairName} bin_step ${candidate.info.binStep}: 同对已持仓`);
+      continue;
+    }
+    // V0.11: 按 pool 类型 cap 检查
+    const cIsStable = candidate.info.tokenXMint !== SOL_MINT && candidate.info.tokenYMint !== SOL_MINT;
+    if (cIsStable && openStable >= CONFIG.MAX_STABLE_POSITIONS) {
+      skipReasons.push(`${candidate.info.pairName}: stable 类已满 ${openStable}/${CONFIG.MAX_STABLE_POSITIONS}`);
+      continue;
+    }
+    if (!cIsStable && openVolatile >= CONFIG.MAX_VOLATILE_POSITIONS) {
+      skipReasons.push(`${candidate.info.pairName}: volatile 类已满 ${openVolatile}/${CONFIG.MAX_VOLATILE_POSITIONS}`);
       continue;
     }
     chosen = candidate;
@@ -2579,6 +2658,117 @@ bot.command('pnl', async (ctx) => {
   }
 });
 
+// V0.11: /portfolio 命令 - 账户级真实 PnL + SOL 暴露视图 (混合策略验证用)
+bot.command('portfolio', async (ctx) => {
+  try {
+    // 1. 钱包快照
+    const walletSnap = await getWalletSnapshot();
+
+    // 2. 当前持仓分类
+    const positions = await getUserPositions();
+    let volatileUsd = 0, stableUsd = 0;
+    let volatileCount = 0, stableCount = 0;
+    let solExposureUsd = 0;  // SOL 在仓位中的等值 USD (LP 里的 SOL 部分)
+    const positionLines: string[] = [];
+
+    for (const p of positions) {
+      const v = await estimatePositionValueUsd(p);
+      const posUsd = v.totalUsd + v.feeUsd;
+      const isStable = p.tokenXMint !== SOL_MINT && p.tokenYMint !== SOL_MINT;
+      if (isStable) {
+        stableUsd += posUsd;
+        stableCount++;
+      } else {
+        volatileUsd += posUsd;
+        volatileCount++;
+        // SOL 暴露 = SOL 端的 token amount × SOL 价格
+        const solPrice = await getTokenPriceUsd(SOL_MINT);
+        const solAmt = p.tokenXMint === SOL_MINT ? p.totalXAmountFloat : p.totalYAmountFloat;
+        solExposureUsd += solAmt * solPrice;
+      }
+      positionLines.push(
+        `  • ${isStable ? '🟢' : '🟡'} ${p.pairName} bin_step ${p.binStep}: ${fmtUsd(posUsd)} ${p.inRange ? '✅' : '⚠️出range'}`
+      );
+    }
+    const totalAccountUsd = walletSnap.totalUsableUsd + volatileUsd + stableUsd;
+    const accountTotal = totalAccountUsd;
+    // 钱包里的 SOL 也是 SOL 暴露
+    solExposureUsd += walletSnap.solUsd;
+
+    // 3. baseline 查询
+    let baselineUsd: number | null = null;
+    let baselineDate: string | null = null;
+    try {
+      const r = await db.query<{ value: string; updated_at: Date }>(
+        `SELECT value, updated_at FROM account_settings WHERE key = 'baseline_usd'`
+      );
+      if (r.rows.length > 0) {
+        baselineUsd = parseFloat(r.rows[0].value);
+        baselineDate = r.rows[0].updated_at.toISOString().slice(0, 10);
+      }
+    } catch {}
+
+    // 4. 分段 fee 收益 (7d) 按类型
+    const pnl7dR = await db.query<{ pair_name: string; pnl_sum: string; cnt: string }>(
+      `SELECT pair_name, SUM(pnl_usd) as pnl_sum, COUNT(*) as cnt
+       FROM pnl_history
+       WHERE closed_at > NOW() - INTERVAL '7 days'
+       GROUP BY pair_name`
+    );
+    let volatileFee7d = 0, stableFee7d = 0;
+    let volatileTrades = 0, stableTrades = 0;
+    for (const row of pnl7dR.rows) {
+      // 判断 pair_name 是否含 SOL (粗略, SOL/USDC 等 vs USDC/USDT)
+      const isStableName = !row.pair_name.toUpperCase().includes('SOL');
+      const v = parseFloat(row.pnl_sum);
+      const c = parseInt(row.cnt);
+      if (isStableName) { stableFee7d += v; stableTrades += c; }
+      else { volatileFee7d += v; volatileTrades += c; }
+    }
+
+    // 5. 渲染
+    const pctOfTotal = (n: number) => accountTotal > 0 ? `${((n / accountTotal) * 100).toFixed(1)}%` : '0%';
+    let msg = `💼 <b>账户组合视图</b> (V0.11 混合策略)\n\n`;
+    msg += `<b>账户总值: ${fmtUsd(accountTotal)}</b>\n`;
+    msg += `  钱包闲钱: ${fmtUsd(walletSnap.totalUsableUsd)} (${pctOfTotal(walletSnap.totalUsableUsd)})\n`;
+    msg += `  仓位价值: ${fmtUsd(volatileUsd + stableUsd)} (${pctOfTotal(volatileUsd + stableUsd)})\n\n`;
+
+    msg += `🎯 <b>配置分布</b>\n`;
+    msg += `  🟡 Volatile (SOL pair): ${fmtUsd(volatileUsd)} (${pctOfTotal(volatileUsd)}) - ${volatileCount}/${CONFIG.MAX_VOLATILE_POSITIONS} 仓位\n`;
+    msg += `  🟢 Stable (USD pair):   ${fmtUsd(stableUsd)} (${pctOfTotal(stableUsd)}) - ${stableCount}/${CONFIG.MAX_STABLE_POSITIONS} 仓位\n\n`;
+
+    if (positionLines.length > 0) {
+      msg += `📍 <b>持仓明细</b>\n${positionLines.join('\n')}\n\n`;
+    }
+
+    msg += `📊 <b>真实账户 PnL</b>\n`;
+    if (baselineUsd !== null) {
+      const pnlAbs = accountTotal - baselineUsd;
+      const pnlPct = (pnlAbs / baselineUsd) * 100;
+      const emoji = pnlAbs >= 0 ? '🟢' : '🔴';
+      msg += `  Baseline: ${fmtUsd(baselineUsd)} (${baselineDate})\n`;
+      msg += `  当前总值: ${fmtUsd(accountTotal)}\n`;
+      msg += `  ${emoji} 账户盈亏: ${pnlAbs >= 0 ? '+' : ''}${fmtUsd(pnlAbs)} (${pnlPct >= 0 ? '+' : ''}${pnlPct.toFixed(2)}%)\n\n`;
+    } else {
+      msg += `  Baseline 未设置 (用 /setbaseline 设置)\n\n`;
+    }
+
+    msg += `💰 <b>7d Fee 收益 (按类型)</b>\n`;
+    msg += `  🟡 Volatile: ${volatileFee7d >= 0 ? '+' : ''}${fmtUsd(volatileFee7d)} (${volatileTrades} trades)\n`;
+    msg += `  🟢 Stable:   ${stableFee7d >= 0 ? '+' : ''}${fmtUsd(stableFee7d)} (${stableTrades} trades)\n\n`;
+
+    msg += `⚠️ <b>SOL 价格暴露</b>\n`;
+    msg += `  仓位+钱包 SOL: ${fmtUsd(solExposureUsd)} (${pctOfTotal(solExposureUsd)})\n`;
+    msg += `  SOL 跌 10% 损失估算: ~${fmtUsd(solExposureUsd * 0.1)}\n`;
+    msg += `  SOL 跌 30% 损失估算: ~${fmtUsd(solExposureUsd * 0.3)}\n`;
+
+    await ctx.reply(msg, { parse_mode: 'HTML' });
+  } catch (e: any) {
+    console.error(`[/portfolio] ${e.message}`);
+    await ctx.reply(`❌ ${e.message}`);
+  }
+});
+
 // V0.10: /setbaseline 命令 - 设置账户维度起始本金
 bot.command('setbaseline', async (ctx) => {
   const args = ctx.message.text.split(/\s+/).slice(1);
@@ -2652,11 +2842,28 @@ bot.command('auto', async (ctx) => {
     state.autoTrading = true;
     state.paused = false;
     state.lastScanTs = 0;  // 清缓存,让下次 tick 立刻扫描
-    await ctx.reply(`🟢 Auto ON${CONFIG.DRY_RUN ? ' (DRY_RUN)' : ''}\n下次自动扫描将在 2 分钟内触发(发 /now 立刻触发)`);
+    // V0.11.0a: 持久化到 DB,防 Railway redeploy 后丢失
+    try {
+      await db.query(
+        `INSERT INTO account_settings(key, value, updated_at) VALUES('auto_trading', 1, NOW())
+         ON CONFLICT (key) DO UPDATE SET value=1, updated_at=NOW()`
+      );
+      await db.query(
+        `INSERT INTO account_settings(key, value, updated_at) VALUES('paused', 0, NOW())
+         ON CONFLICT (key) DO UPDATE SET value=0, updated_at=NOW()`
+      );
+    } catch (e: any) { console.error(`[/auto on] persist: ${e.message}`); }
+    await ctx.reply(`🟢 Auto ON${CONFIG.DRY_RUN ? ' (DRY_RUN)' : ''}\n下次自动扫描将在 2 分钟内触发(发 /now 立刻触发)\n💾 状态已持久化, 重启自动恢复`);
     await logEvent('auto_on', {});
   } else if (cmd === 'off') {
     state.autoTrading = false;
-    await ctx.reply('⚪ Auto OFF');
+    try {
+      await db.query(
+        `INSERT INTO account_settings(key, value, updated_at) VALUES('auto_trading', 0, NOW())
+         ON CONFLICT (key) DO UPDATE SET value=0, updated_at=NOW()`
+      );
+    } catch (e: any) { console.error(`[/auto off] persist: ${e.message}`); }
+    await ctx.reply('⚪ Auto OFF (已持久化)');
     await logEvent('auto_off', {});
   } else {
     await ctx.reply(`auto = ${state.autoTrading ? 'on' : 'off'}\n用法: /auto on|off`);
@@ -2684,7 +2891,14 @@ bot.command('now', async (ctx) => {
 
 bot.command('pause', async (ctx) => {
   state.paused = true;
-  await ctx.reply('🔴 Paused. 已停止所有自动动作(rebalance/claim/SL),仓位不动。/resume 恢复');
+  // V0.11.0a: 持久化
+  try {
+    await db.query(
+      `INSERT INTO account_settings(key, value, updated_at) VALUES('paused', 1, NOW())
+       ON CONFLICT (key) DO UPDATE SET value=1, updated_at=NOW()`
+    );
+  } catch (e: any) { console.error(`[/pause] persist: ${e.message}`); }
+  await ctx.reply('🔴 Paused. 已停止所有自动动作(rebalance/claim/SL),仓位不动。/resume 恢复\n💾 状态已持久化');
   await logEvent('pause', {});
 });
 
@@ -2692,7 +2906,14 @@ bot.command('resume', async (ctx) => {
   state.paused = false;
   state.autoResumablePausedAt = 0;  // V0.9.2: 手动 resume 也清除自动恢复时间戳
   state.autoResumeReason = '';
-  await ctx.reply('🟢 Resumed');
+  // V0.11.0a: 持久化
+  try {
+    await db.query(
+      `INSERT INTO account_settings(key, value, updated_at) VALUES('paused', 0, NOW())
+       ON CONFLICT (key) DO UPDATE SET value=0, updated_at=NOW()`
+    );
+  } catch (e: any) { console.error(`[/resume] persist: ${e.message}`); }
+  await ctx.reply('🟢 Resumed (已持久化)');
   await logEvent('resume', {});
 });
 
@@ -3322,6 +3543,23 @@ async function start() {
 
   await initDb();
   state.candidatePools = await loadCandidatePools();
+
+  // V0.11.0a: 启动时从 DB 恢复 autoTrading + paused 状态(防 Railway redeploy 后状态丢失)
+  // 注意: account_settings.value 是 NUMERIC(18,4), 用 1=true / 0=false
+  try {
+    const stR = await db.query<{ key: string; value: string }>(
+      `SELECT key, value FROM account_settings WHERE key IN ('auto_trading', 'paused')`
+    );
+    for (const row of stR.rows) {
+      const isTrue = parseFloat(row.value) > 0;
+      if (row.key === 'auto_trading') state.autoTrading = isTrue;
+      if (row.key === 'paused') state.paused = isTrue;
+    }
+    console.log(`[startup] restored state: autoTrading=${state.autoTrading}, paused=${state.paused}`);
+  } catch (e: any) {
+    console.error(`[startup] state restore failed: ${e.message}`);
+  }
+
   await logEvent('boot', { wallet: wallet.publicKey.toBase58(), dryRun: CONFIG.DRY_RUN });
 
   // 给上一个进程 5 秒退出时间
@@ -3360,7 +3598,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.10.5 (RPC 限流修复: inter-pool sleep + retry backoff)\n` +
+    `Version: V0.11.0a (混合策略 + 状态持久化: SOL/USDC + USDC/USDT, depeg 监控, /portfolio)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
