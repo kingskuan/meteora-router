@@ -1,7 +1,7 @@
 {
   "name": "meteora-router",
-  "version": "0.10.2",
-  "description": "Meteora DLMM auto rebalance bot - V0.10.2 (HTML escape in disclaimer)",
+  "version": "0.10.5",
+  "description": "Meteora DLMM auto rebalance bot - V0.10.5 (RPC throttle: inter-pool sleep + retry backoff)",
   "main": "dist/bot.js",
   "scripts": {
     "build": "tsc -p .",

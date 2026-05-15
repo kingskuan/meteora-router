@@ -715,7 +715,7 @@ async function getOnchainFeeStats(
       lbPairPk,
       { limit: 1000, before: beforeSig },
       'confirmed',
-    ), 2, 500);
+    ), 3, 1500);  // V0.10.5: 2→3 次, 500→1500ms backoff (Helius -32413 限流恢复)
     if (!batch || batch.length === 0) break;
     pages++;
     let stop = false;
@@ -747,7 +747,7 @@ async function getOnchainFeeStats(
     const txs = await retry(() => connection.getTransactions(
       batch.map(s => s.signature),
       { maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
-    ), 2, 500);
+    ), 3, 1500);  // V0.10.5: 2→3 次, 500→1500ms backoff
 
     for (const tx of (txs || [])) {
       const logs = tx?.meta?.logMessages;
@@ -1061,7 +1061,13 @@ async function scanPools(): Promise<ScoredPool[]> {
   state.candidatePools = await loadCandidatePools();
   const results: ScoredPool[] = [];
 
-  for (const addr of state.candidatePools) {
+  // V0.10.5: 池子之间 inter-pool sleep,防 Helius RPC burst 触发 -32413 限流
+  // 之前 6 个池子串行 burst → ~180 RPC 调用瞬时打过去 → 整批 413
+  // 现在每个池子之间 2s,scan 总耗时 +12s (扫描间隔 30min,可忽略)
+  const INTER_POOL_SLEEP_MS = parseInt(process.env.INTER_POOL_SLEEP_MS || '2000');
+
+  for (let idx = 0; idx < state.candidatePools.length; idx++) {
+    const addr = state.candidatePools[idx];
     try {
       const info = await getPoolInfo(addr);
       const { score, reasons } = scorePool(info);
@@ -1085,6 +1091,11 @@ async function scanPools(): Promise<ScoredPool[]> {
         );
         console.log(`Auto-disabled ${addr}: ${msg.slice(0, 80)}`);
       }
+    }
+
+    // V0.10.5: 最后一个池子之后不 sleep
+    if (idx < state.candidatePools.length - 1) {
+      await sleep(INTER_POOL_SLEEP_MS);
     }
   }
 
@@ -3349,7 +3360,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.10.4 (Jupiter v6 → lite-api 迁移 + SWAP_MAX_IMPACT 默认 5%)\n` +
+    `Version: V0.10.5 (RPC 限流修复: inter-pool sleep + retry backoff)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
