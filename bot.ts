@@ -41,6 +41,11 @@ import Decimal from 'decimal.js';
 
 const CONFIG = {
   RPC_URL: process.env.HELIUS_RPC_URL || 'https://api.mainnet-beta.solana.com',
+  // V0.11.0d: 双 RPC fallback - 仅用于「只读重 IO」调用 (onchain-fee 的 getSignatures/getTransactions)
+  // 链上交易仍只走 primary (blockhash + 签名一致性)
+  // 默认 PublicNode (免费/不用注册/支持 Solana 全 RPC method)
+  // Railway env RPC_URL_BACKUP 可换 QuickNode/Triton/Ankr; 设为空字符串则禁用 fallback
+  RPC_URL_BACKUP: process.env.RPC_URL_BACKUP ?? 'https://solana-rpc.publicnode.com',
   WALLET_PRIVATE_KEY: process.env.WALLET_PRIVATE_KEY || '',
   TG_BOT_TOKEN: process.env.TG_BOT_TOKEN || '',
   TG_OWNER_ID: parseInt(process.env.TG_OWNER_ID || '0'),
@@ -75,7 +80,9 @@ const CONFIG = {
   SINGLE_SIDED_DUST_TOKEN: 1e-3,            // 某 token amount 低于此值 → 视为 100% single-sided
   // CLAIM_THRESHOLD_PCT 已废弃 (V0.8 Zip 1) — 现在统一走 #3 自动 Claim Agent
   CHECK_INTERVAL_MS: 30_000,
-  SCAN_INTERVAL_MS: 30 * 60_000,     // 30min (V0.1 开发期紧凑值,V0.2 生产期可调到 4h)
+  // V0.11.0e: SCAN_INTERVAL_MS env 化 (默认 30min, 高波动期可调 10min, 稳定期可调 4h)
+  // Railway env: SCAN_INTERVAL_MS=600000 (10min) / 14400000 (4h)
+  SCAN_INTERVAL_MS: parseInt(process.env.SCAN_INTERVAL_MS || (30 * 60_000).toString()),
   AUTO_TICK_EVERY_N_LOOPS: 4,        // 每 4 个 loop (~2 分钟) 触发 tickAutoOpen
   SWITCH_SCORE_DIFF: 20,             // 新池分高 20+ 才换仓
 
@@ -189,6 +196,11 @@ function loadKeypair(): Keypair {
 
 const wallet = loadKeypair();
 const connection = new Connection(CONFIG.RPC_URL, 'confirmed');
+// V0.11.0d: backup RPC connection (仅用于只读重 IO 调用 onchain-fee)
+// 空字符串则禁用 fallback (Kings 想完全禁用可在 Railway 设 RPC_URL_BACKUP="")
+const connectionBackup: Connection | null = CONFIG.RPC_URL_BACKUP
+  ? new Connection(CONFIG.RPC_URL_BACKUP, 'confirmed')
+  : null;
 // V0.11.0c FIX: handlerTimeout: Infinity 防止 Telegraf 默认 90s 杀长 handler
 // 之前 bug: /confirm 触发 openPosition 链上重试 90s+ → Telegraf 默认 pTimeout 砍 handler
 // → unhandled rejection 杀掉 polling → bot 再也收不到消息
@@ -221,6 +233,50 @@ async function retry<T>(fn: () => Promise<T>, n = 3, delay = 1000): Promise<T> {
       return await fn();
     } catch (e: any) {
       lastErr = e;
+      if (i < n - 1) await sleep(delay * (i + 1));
+    }
+  }
+  throw lastErr;
+}
+
+// V0.11.0d: retry with RPC fallback
+// 主 RPC 限流 (413 / -32413 / "Too many requests") 时立刻切 backup, 不浪费 retry quota
+// 其他错误正常按主 RPC retry n 次
+// 用法: retryWithFallback((conn) => conn.getSignaturesForAddress(...))
+function isRateLimitErr(e: any): boolean {
+  const msg = (e?.message || '').toString();
+  return msg.includes('413') ||
+         msg.includes('-32413') ||
+         msg.includes('Too many requests') ||
+         msg.includes('Too Many Requests') ||
+         msg.includes('429');
+}
+
+async function retryWithFallback<T>(
+  fn: (conn: Connection) => Promise<T>,
+  n = 3,
+  delay = 1000,
+): Promise<T> {
+  let lastErr: any;
+  let usingBackup = false;
+  for (let i = 0; i < n; i++) {
+    const conn = (usingBackup && connectionBackup) ? connectionBackup : connection;
+    try {
+      const result = await fn(conn);
+      if (usingBackup) {
+        console.log(`[rpc-fallback] backup ok (primary 限流, 已成功降级)`);
+      }
+      return result;
+    } catch (e: any) {
+      lastErr = e;
+      const rateLimit = isRateLimitErr(e);
+      // 限流且有 backup 且当前还在 primary → 立刻切 backup, 不消耗 retry 次数
+      if (rateLimit && connectionBackup && !usingBackup) {
+        usingBackup = true;
+        console.warn(`[rpc-fallback] primary rate-limited, switching to backup`);
+        continue; // 不 sleep, 立刻试 backup
+      }
+      // 其他错误 (或 backup 也限流) → 正常 retry backoff
       if (i < n - 1) await sleep(delay * (i + 1));
     }
   }
@@ -753,7 +809,8 @@ async function _getOnchainFeeStatsImpl(
   let beforeSig: string | undefined = undefined;
   let pages = 0;
   while (pages < 5) {
-    const batch: any = await retry(() => connection.getSignaturesForAddress(
+    // V0.11.0d: 用 retryWithFallback, 主 RPC 限流时立刻切 backup
+    const batch: any = await retryWithFallback((conn) => conn.getSignaturesForAddress(
       lbPairPk,
       { limit: 1000, before: beforeSig },
       'confirmed',
@@ -786,7 +843,8 @@ async function _getOnchainFeeStatsImpl(
 
   for (let i = 0; i < allSigs.length; i += BATCH_SIZE) {
     const batch = allSigs.slice(i, i + BATCH_SIZE);
-    const txs = await retry(() => connection.getTransactions(
+    // V0.11.0d: 用 retryWithFallback, 主 RPC 限流时立刻切 backup
+    const txs = await retryWithFallback((conn) => conn.getTransactions(
       batch.map(s => s.signature),
       { maxSupportedTransactionVersion: 0, commitment: 'confirmed' },
     ), 3, 1500);  // V0.10.5: 2→3 次, 500→1500ms backoff
@@ -3065,7 +3123,6 @@ bot.command('confirm', async (ctx) => {
   state.firstOpenConfirmed = true;
   await ctx.reply('✅ 已确认,后台执行中(链上重试可能 60-120s)...');
   // V0.11.0c FIX: fire-and-forget openPosition, 不阻塞 handler
-  // 即使 handler timeout 已经 Infinity, 也仍然建议 fast ack —— UX 更好
   // 错误通过 notify() 走 TG, 不依赖 ctx (ctx 在 fire-and-forget 下可能已失效)
   openPosition(c.lbPair, c.amountUsd).catch(async (e: any) => {
     console.error(`[/confirm] openPosition failed: ${e?.message}`);
@@ -3686,10 +3743,12 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.0c (handlerTimeout Infinity + bot.catch + /confirm 非阻塞)\n` +
+    `Version: V0.11.0e (V0.11.0d + SCAN_INTERVAL env 化)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
+    `主 RPC: ${CONFIG.RPC_URL.includes('helius') ? '🟢 Helius' : '⚪ ' + (new URL(CONFIG.RPC_URL)).hostname}\n` +
+    `备 RPC: ${connectionBackup ? '🟢 ' + (new URL(CONFIG.RPC_URL_BACKUP)).hostname : '⚪ 未启用'}\n` +
     `LLM API: ${CONFIG.ANTHROPIC_API_KEY ? '🟢 已配置 (Haiku)' : '⚪ 未配置 (#2 agent 跳过)'}\n` +
     `自动 Claim: ${CONFIG.AUTO_CLAIM_ENABLED ? `🟢 阈值 ${fmtUsd(CONFIG.AUTO_CLAIM_THRESHOLD_USD)}` : '⚪ 已禁用'}\n` +
     `止损: 🚨 -${CONFIG.HARD_SL_PCT}% 硬止损 + ⚠️ -${CONFIG.STOP_LOSS_WARN_PCT}% 软警告 (连续 ${CONFIG.STOP_LOSS_CONSECUTIVE} 次触发)\n` +
