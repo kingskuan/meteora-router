@@ -75,6 +75,18 @@ const CONFIG = {
 
   // 策略默认
   RANGE_PCT: 10,
+  // V0.11.0g: regime-aware range (按 marketRegime agent 输出动态选 range)
+  // 单位都是 total range %, ±halfRange = pct/2
+  // 默认值矩阵设计逻辑:
+  //   稳定 → 价格不动, 窄 range 集中流动性吃 fee 密度
+  //   震荡 → 来回拉锯, 中等 range 抓双向 swap
+  //   趋势 → 单向走, 窄 range 跟价 + 频繁 rebalance
+  //   高波动 → 防 rebalance + 让 dynamic fee 自动补偿 IL
+  // Railway env 可调
+  REGIME_RANGE_STABLE: parseFloat(process.env.REGIME_RANGE_STABLE || '3'),         // 稳定: 总 3% (±1.5%)
+  REGIME_RANGE_OSCILLATION: parseFloat(process.env.REGIME_RANGE_OSCILLATION || '6'),// 震荡: 总 6% (±3%)
+  REGIME_RANGE_TREND: parseFloat(process.env.REGIME_RANGE_TREND || '4'),           // 趋势: 总 4% (±2%)
+  REGIME_RANGE_HIGH_VOL: parseFloat(process.env.REGIME_RANGE_HIGH_VOL || '10'),    // 高波动: 总 10% (±5%, 跟原 RANGE_PCT 一致)
   REBALANCE_THRESHOLD: 0.45,                // 漂移触发阈值(保留作为兜底)
   REBALANCE_COOLDOWN_MS: 5 * 60_000,        // rebalance 后 5 分钟内同 pair 不再触发(防抖)
   SINGLE_SIDED_DUST_TOKEN: 1e-3,            // 某 token amount 低于此值 → 视为 100% single-sided
@@ -1517,9 +1529,28 @@ async function _openPositionImpl(lbPair: string, amountUsd: number): Promise<{ p
   // (Solana realloc 上限 10240 bytes,每 bin 数据空间限制)
   // 所以 halfBins 最大 34(总 69 bins,留 1 buffer)
   //
-  // V0.11: 按 pool 类型选 range (stable 池 ±0.2%, volatile 池 ±5%)
+  // V0.11.0g: regime-aware range
+  // - stable 池保持固定 (跟波动无关, 看脱锚事件)
+  // - volatile 池按 marketRegime agent 输出选 range
+  // - regime='未知' (启动后 agent 还没跑过) → fallback 到 CONFIG.RANGE_PCT
   const isStableStable = tokenXMint !== SOL_MINT && tokenYMint !== SOL_MINT;
-  const effectiveRangePct = isStableStable ? CONFIG.STABLE_RANGE_PCT : CONFIG.RANGE_PCT;
+  let effectiveRangePct: number;
+  let rangeReason: string;
+
+  if (isStableStable) {
+    effectiveRangePct = CONFIG.STABLE_RANGE_PCT;
+    rangeReason = 'stable 池固定';
+  } else {
+    const regime = agentState.lastMarketRegime;
+    const regimeRangeMap: Record<string, number> = {
+      '稳定':   CONFIG.REGIME_RANGE_STABLE,
+      '震荡':   CONFIG.REGIME_RANGE_OSCILLATION,
+      '趋势':   CONFIG.REGIME_RANGE_TREND,
+      '高波动': CONFIG.REGIME_RANGE_HIGH_VOL,
+    };
+    effectiveRangePct = regimeRangeMap[regime] ?? CONFIG.RANGE_PCT;
+    rangeReason = regime in regimeRangeMap ? `regime=${regime}` : `regime=${regime}(fallback RANGE_PCT)`;
+  }
   const halfPctTarget = effectiveRangePct / 2;
   let halfRangeBins = Math.max(3, Math.ceil((halfPctTarget * 100) / binStep));
   if (halfRangeBins > 34) halfRangeBins = 34; // SDK V1 单 position 70 bins 上限
@@ -1529,7 +1560,7 @@ async function _openPositionImpl(lbPair: string, amountUsd: number): Promise<{ p
   // 实际 range 百分比(用于日志 + 通知)
   const totalBins = (maxBinId - minBinId + 1);
   const actualRangePct = (Math.pow(1 + binStep / 10000, totalBins) - 1) * 100;
-  console.log(`[openPosition] type=${isStableStable ? 'stable' : 'volatile'}, bin_step=${binStep}, target=±${halfPctTarget}%, halfBins=${halfRangeBins}, total=${totalBins} bins, actualRange=${actualRangePct.toFixed(2)}%`);
+  console.log(`[openPosition] type=${isStableStable ? 'stable' : 'volatile'}, ${rangeReason}, bin_step=${binStep}, target=±${halfPctTarget}%, halfBins=${halfRangeBins}, total=${totalBins} bins, actualRange=${actualRangePct.toFixed(2)}%`);
 
   // 目标 50/50:amountUsd / 2 在 X,amountUsd / 2 在 Y
   const xPrice = await getTokenPriceUsd(tokenXMint);
@@ -1607,7 +1638,8 @@ async function _openPositionImpl(lbPair: string, amountUsd: number): Promise<{ p
     `🔨 <b>开仓中...</b>\n` +
     `${tokenSymbol(tokenXMint)}/${tokenSymbol(tokenYMint)} (bin_step ${binStep})\n` +
     `投入: ${fmtUsd(amountUsd)} (${xAmountFloat.toFixed(4)} ${tokenSymbol(tokenXMint)} + ${yAmountFloat.toFixed(2)} ${tokenSymbol(tokenYMint)})\n` +
-    `range: bin ${minBinId}~${maxBinId} (active ${activeBin.binId})\n` +
+    `range: ±${halfPctTarget}% (${rangeReason})\n` +
+    `bins: ${minBinId}~${maxBinId} (active ${activeBin.binId})\n` +
     `${CONFIG.DRY_RUN ? '⚠️ DRY_RUN 模式' : ''}`
   );
 
@@ -3743,7 +3775,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.0e (V0.11.0d + SCAN_INTERVAL env 化)\n` +
+    `Version: V0.11.0g (V0.11.0e + regime-aware range)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
@@ -3754,6 +3786,7 @@ async function start() {
     `止损: 🚨 -${CONFIG.HARD_SL_PCT}% 硬止损 + ⚠️ -${CONFIG.STOP_LOSS_WARN_PCT}% 软警告 (连续 ${CONFIG.STOP_LOSS_CONSECUTIVE} 次触发)\n` +
     `智能恢复: ${CONFIG.AUTO_RESUME_ENABLED ? `🟢 ${CONFIG.AUTO_RESUME_MIN}min 后 + 市场状态确认` : '⚪ 已禁用'}\n` +
     `开仓: ${(CONFIG.POSITION_PCT * 100).toFixed(0)}% × 钱包,单仓上限 ${fmtUsd(CONFIG.MAX_POSITION_USD)},最多 ${CONFIG.MAX_OPEN_POSITIONS} 个并发\n` +
+    `Regime Range (volatile): 稳定±${CONFIG.REGIME_RANGE_STABLE/2}% / 震荡±${CONFIG.REGIME_RANGE_OSCILLATION/2}% / 趋势±${CONFIG.REGIME_RANGE_TREND/2}% / 高波动±${CONFIG.REGIME_RANGE_HIGH_VOL/2}%\n` +
     `总敞口上限: ${(CONFIG.TOTAL_EXPOSURE_PCT * 100).toFixed(0)}% × 钱包总值\n\n` +
     `下一步:\n` +
     `1. /agents 查看 agent 状态\n` +
