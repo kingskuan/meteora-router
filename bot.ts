@@ -189,7 +189,10 @@ function loadKeypair(): Keypair {
 
 const wallet = loadKeypair();
 const connection = new Connection(CONFIG.RPC_URL, 'confirmed');
-const bot = new Telegraf(CONFIG.TG_BOT_TOKEN);
+// V0.11.0c FIX: handlerTimeout: Infinity 防止 Telegraf 默认 90s 杀长 handler
+// 之前 bug: /confirm 触发 openPosition 链上重试 90s+ → Telegraf 默认 pTimeout 砍 handler
+// → unhandled rejection 杀掉 polling → bot 再也收不到消息
+const bot = new Telegraf(CONFIG.TG_BOT_TOKEN, { handlerTimeout: Infinity });
 
 const db = new Pool({
   connectionString: CONFIG.DATABASE_URL,
@@ -2318,6 +2321,20 @@ async function tickAutoOpen(verbose: boolean = false) {
 // 14. TG 命令
 // ============================================================
 
+// V0.11.0c FIX: 全局 bot.catch handler
+// 即使将来某个 handler 还是抛错(网络异常/RPC 抽风等), polling 不会再死
+// 取代 Telegraf 默认的 "Unhandled error while processing" 行为
+bot.catch(async (err: any, ctx) => {
+  const uid = ctx.update?.update_id;
+  const cmd = (ctx.update as any)?.message?.text || '<unknown>';
+  console.error(`[bot.catch] update=${uid} cmd=${cmd} err=${err?.message || err}`);
+  try {
+    await ctx.reply(`❌ handler 出错(已隔离,bot 不会死):\n${(err?.message || err).toString().slice(0, 200)}`);
+  } catch (replyErr: any) {
+    console.error(`[bot.catch] reply also failed: ${replyErr?.message}`);
+  }
+});
+
 bot.use(async (ctx, next) => {
   if (ctx.from?.id !== CONFIG.TG_OWNER_ID) {
     console.log(`⛔ Unauthorized: ${ctx.from?.id}`);
@@ -3046,12 +3063,14 @@ bot.command('confirm', async (ctx) => {
   }
   state.pendingConfirmation = null;
   state.firstOpenConfirmed = true;
-  await ctx.reply('✅ 已确认,执行中...');
-  try {
-    await openPosition(c.lbPair, c.amountUsd);
-  } catch (e: any) {
-    await ctx.reply(`❌ ${e.message}`);
-  }
+  await ctx.reply('✅ 已确认,后台执行中(链上重试可能 60-120s)...');
+  // V0.11.0c FIX: fire-and-forget openPosition, 不阻塞 handler
+  // 即使 handler timeout 已经 Infinity, 也仍然建议 fast ack —— UX 更好
+  // 错误通过 notify() 走 TG, 不依赖 ctx (ctx 在 fire-and-forget 下可能已失效)
+  openPosition(c.lbPair, c.amountUsd).catch(async (e: any) => {
+    console.error(`[/confirm] openPosition failed: ${e?.message}`);
+    await notify(`❌ /confirm 后台开仓失败:\n${e?.message || e}`);
+  });
 });
 
 bot.command('cancel', async (ctx) => {
@@ -3667,7 +3686,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.0b (修复并发开仓锁 + RPC 失败缓存 + stable APR min 1%)\n` +
+    `Version: V0.11.0c (handlerTimeout Infinity + bot.catch + /confirm 非阻塞)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
