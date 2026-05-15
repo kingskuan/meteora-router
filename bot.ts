@@ -144,6 +144,10 @@ interface RuntimeState {
   autoTrading: boolean;     // 自动开仓开关
   firstOpenConfirmed: boolean; // 首次开仓二次确认状态
   rebalancing: boolean;     // V2.3: rebalance 进行中(防 tickAutoOpen 并发触发开仓)
+  // V0.11.0b: 开仓中标志(防 tickAutoOpen 在 openPosition 期间被重复触发,导致同对重复开仓)
+  opening: boolean;
+  openingLbPair: string;
+  openingStartTs: number;
   autoResumablePausedAt: number; // V0.9.2: 止损/rebalance失败导致的 paused 时间戳(0=非此原因)
   autoResumeReason: string;      // V0.9.2: 给智能恢复显示用的人话原因
   pendingConfirmation: null | {
@@ -161,6 +165,9 @@ const state: RuntimeState = {
   autoTrading: false,
   firstOpenConfirmed: false,
   rebalancing: false,
+  opening: false,             // V0.11.0b
+  openingLbPair: '',          // V0.11.0b
+  openingStartTs: 0,          // V0.11.0b
   autoResumablePausedAt: 0,
   autoResumeReason: '',
   pendingConfirmation: null,
@@ -705,11 +712,35 @@ async function getOnchainFeeStats(
   hours: number = 24,
 ): Promise<OnchainFeeStats> {
 
-  // 缓存
+  // 缓存(命中包括失败 empty - V0.11.0b)
   const cached = onchainFeeCache.get(lbPair);
   if (cached && Date.now() - cached.ts < ONCHAIN_FEE_CACHE_MS) {
     return cached.stats;
   }
+
+  // V0.11.0b: 整体 try-catch, 任何失败缓存 5min empty 防 RPC 反复重试
+  try {
+    return await _getOnchainFeeStatsImpl(lbPair, tvlUsd, tokenXPrice, tokenYPrice, tokenXDec, tokenYDec, hours);
+  } catch (e: any) {
+    const failedEmpty: OnchainFeeStats = { fees24hUsd: 0, volume24hUsd: 0, feeApr: null, swapCount: 0, source: 'onchain' };
+    // 缓存 5min (放比正常 30min 短的 ts, 让它 5min 后过期)
+    const fakeTs = Date.now() - (ONCHAIN_FEE_CACHE_MS - 5 * 60_000);
+    onchainFeeCache.set(lbPair, { stats: failedEmpty, ts: fakeTs });
+    console.warn(`[onchain-fee] ${lbPair.slice(0, 8)} failed, cached empty 5min: ${e.message}`);
+    throw e; // 仍 throw, 让上层 catch (getPoolInfo) 知道
+  }
+}
+
+// V0.11.0b: 原 getOnchainFeeStats 逻辑提取成 impl
+async function _getOnchainFeeStatsImpl(
+  lbPair: string,
+  tvlUsd: number,
+  tokenXPrice: number,
+  tokenYPrice: number,
+  tokenXDec: number,
+  tokenYDec: number,
+  hours: number = 24,
+): Promise<OnchainFeeStats> {
 
   const cutoffTs = Math.floor(Date.now() / 1000) - hours * 3600;
   const lbPairPk = new PublicKey(lbPair);
@@ -1040,9 +1071,10 @@ function scorePool(p: PoolInfo): { score: number; reasons: string[] } {
     reasons.push('无 APR 数据');
     return { score: -1, reasons };
   }
-  const minApr = isStableStable ? 3 : 15;
+  // V0.11.0b: stable 池 min APR 3% → 1% (USDC/USDT 池子整体 APR 通常 1-3%, concentrated 后实际拿到更高)
+  const minApr = isStableStable ? 1 : 15;
   if (p.feeApr < minApr) {
-    reasons.push(`APR ${fmtPct(p.feeApr)} < ${minApr}%`);
+    reasons.push(`APR ${fmtPct(p.feeApr)} < ${minApr}% (${isStableStable ? 'stable' : 'volatile'})`);
     return { score: -1, reasons };
   }
   if (p.feeApr > 500) {
@@ -1365,12 +1397,39 @@ async function swapTokens(
 // ============================================================
 
 /**
+ * V0.11.0b: openPosition 并发锁 wrapper
+ *
+ * 防 tickAutoOpen / /open / /confirm / rebalance 在另一个 openPosition 进行中时
+ * 重复触发 → 同对重复开仓 (V0.11.0a 部署后发现的真实 bug)
+ *
+ * 锁过期: 5min, 超时自动释放 (避免 throw 路径未释放卡死)
+ */
+async function openPosition(lbPair: string, amountUsd: number): Promise<{ positionPk: string; sig: string; dbId: number }> {
+  if (state.opening) {
+    const elapsed = Date.now() - state.openingStartTs;
+    if (elapsed < 5 * 60_000) {
+      throw new Error(`已有开仓正在进行中: ${state.openingLbPair.slice(0, 8)}... (${Math.floor(elapsed / 1000)}s 前), 请稍后再试`);
+    }
+    console.warn(`[openPosition lock] timeout ${Math.floor(elapsed / 1000)}s, force release ${state.openingLbPair.slice(0, 8)}`);
+  }
+  state.opening = true;
+  state.openingLbPair = lbPair;
+  state.openingStartTs = Date.now();
+  try {
+    return await _openPositionImpl(lbPair, amountUsd);
+  } finally {
+    state.opening = false;
+    state.openingLbPair = '';
+  }
+}
+
+/**
  * 开仓:平衡仓位(50/50),Spot 分布
  *
  * @param lbPair 池地址
  * @param amountUsd 计划总投入(USD 等值)
  */
-async function openPosition(lbPair: string, amountUsd: number): Promise<{ positionPk: string; sig: string; dbId: number }> {
+async function _openPositionImpl(lbPair: string, amountUsd: number): Promise<{ positionPk: string; sig: string; dbId: number }> {
   if (state.paused) throw new Error('bot 已 paused');
   if (amountUsd > CONFIG.MAX_POSITION_USD) throw new Error(`金额 $${amountUsd} > 上限 $${CONFIG.MAX_POSITION_USD}`);
 
@@ -2050,6 +2109,16 @@ async function tickAutoOpen(verbose: boolean = false) {
   if (state.rebalancing) {
     console.log('[tickAutoOpen] skip: rebalance in progress');
     return;
+  }
+
+  // V0.11.0b: 开仓中,跳过(防 openPosition 在等链上确认时,新 tick 重复触发)
+  if (state.opening) {
+    const elapsed = Date.now() - state.openingStartTs;
+    if (elapsed < 5 * 60_000) {
+      console.log(`[tickAutoOpen] skip: opening in progress (${state.openingLbPair.slice(0, 8)}, ${Math.floor(elapsed / 1000)}s)`);
+      return;
+    }
+    // 超时, 让 openPosition 自己 force release
   }
 
   // V0.11: 按类型分别计数 (volatile/stable),并保留总 cap 兜底
@@ -3598,7 +3667,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.0a (混合策略 + 状态持久化: SOL/USDC + USDC/USDT, depeg 监控, /portfolio)\n` +
+    `Version: V0.11.0b (修复并发开仓锁 + RPC 失败缓存 + stable APR min 1%)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
