@@ -1530,8 +1530,9 @@ async function _openPositionImpl(lbPair: string, amountUsd: number): Promise<{ p
   // 所以 halfBins 最大 34(总 69 bins,留 1 buffer)
   //
   // V0.11.0g: regime-aware range
+  // V0.11.0h: 优先用手动覆盖 (/setregime 设的, 6h 内有效), 过期自动回到 LLM
   // - stable 池保持固定 (跟波动无关, 看脱锚事件)
-  // - volatile 池按 marketRegime agent 输出选 range
+  // - volatile 池按 manualRegime > marketRegime 选 range
   // - regime='未知' (启动后 agent 还没跑过) → fallback 到 CONFIG.RANGE_PCT
   const isStableStable = tokenXMint !== SOL_MINT && tokenYMint !== SOL_MINT;
   let effectiveRangePct: number;
@@ -1541,7 +1542,9 @@ async function _openPositionImpl(lbPair: string, amountUsd: number): Promise<{ p
     effectiveRangePct = CONFIG.STABLE_RANGE_PCT;
     rangeReason = 'stable 池固定';
   } else {
-    const regime = agentState.lastMarketRegime;
+    // 优先级: 手动覆盖 (未过期) > LLM agent
+    const manualActive = agentState.manualRegime && Date.now() < agentState.manualRegimeExpiry;
+    const regime = manualActive ? agentState.manualRegime! : agentState.lastMarketRegime;
     const regimeRangeMap: Record<string, number> = {
       '稳定':   CONFIG.REGIME_RANGE_STABLE,
       '震荡':   CONFIG.REGIME_RANGE_OSCILLATION,
@@ -1549,7 +1552,11 @@ async function _openPositionImpl(lbPair: string, amountUsd: number): Promise<{ p
       '高波动': CONFIG.REGIME_RANGE_HIGH_VOL,
     };
     effectiveRangePct = regimeRangeMap[regime] ?? CONFIG.RANGE_PCT;
-    rangeReason = regime in regimeRangeMap ? `regime=${regime}` : `regime=${regime}(fallback RANGE_PCT)`;
+    if (manualActive) {
+      rangeReason = `regime=${regime}(手动)`;
+    } else {
+      rangeReason = regime in regimeRangeMap ? `regime=${regime}` : `regime=${regime}(fallback)`;
+    }
   }
   const halfPctTarget = effectiveRangePct / 2;
   let halfRangeBins = Math.max(3, Math.ceil((halfPctTarget * 100) / binStep));
@@ -2487,13 +2494,20 @@ bot.command('agents', async (ctx) => {
     `上次: ${fmtAgo(agentState.lastHealthCheckAt)}\n` +
     `下次: ${fmtNext(agentState.lastHealthCheckAt, CONFIG.HEALTH_CHECK_INTERVAL_MS)}\n` +
     `结果: ${agentState.lastHealthResult}\n\n` +
-    `<b>🟢 #2 市场状态</b> (LLM Haiku)\n` +
+    `<b>🟢 #2 市场状态</b> (LLM Haiku + V0.11.0h 规则兜底)\n` +
     `LLM API: ${llmAvailable}\n` +
     `间隔: ${(CONFIG.MARKET_REGIME_INTERVAL_MS / 3600000).toFixed(1)}h\n` +
     `上次: ${fmtAgo(agentState.lastMarketRegimeAt)}\n` +
     `下次: ${fmtNext(agentState.lastMarketRegimeAt, CONFIG.MARKET_REGIME_INTERVAL_MS)}\n` +
     `当前: ${escapeHtml(agentState.lastMarketRegime)}\n` +
-    `理由: ${escapeHtml(agentState.lastMarketReason)}\n\n` +
+    `理由: ${escapeHtml(agentState.lastMarketReason)}\n` +
+    (agentState.lastRegimeClampInfo
+      ? `⚠️ 上次兜底: ${escapeHtml(agentState.lastRegimeClampInfo)}\n`
+      : '') +
+    (agentState.manualRegime && Date.now() < agentState.manualRegimeExpiry
+      ? `🔒 手动覆盖: ${escapeHtml(agentState.manualRegime)} (剩 ${Math.ceil((agentState.manualRegimeExpiry - Date.now()) / 60000)} 分钟)\n`
+      : '') +
+    `\n` +
     `<b>💸 LLM 累计成本</b>: $${agentState.llmCostUsd.toFixed(4)}`;
 
   await ctx.reply(msg, { parse_mode: 'HTML' });
@@ -3267,6 +3281,60 @@ bot.command('rmpool', async (ctx) => {
   await ctx.reply(`✅ 已移除`);
 });
 
+// V0.11.0h: 手动覆盖 market regime (优先级高于 LLM agent)
+bot.command('setregime', async (ctx) => {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  const validRegimes = ['稳定', '震荡', '趋势', '高波动'] as const;
+  if (!args[0] || !validRegimes.includes(args[0] as any)) {
+    await ctx.reply(
+      '用法: /setregime <稳定|震荡|趋势|高波动>\n\n' +
+      '功能: 6h 内强制覆盖 LLM agent 判断,影响下次开仓的 range 选择\n' +
+      `当前 LLM 判: ${agentState.lastMarketRegime}\n` +
+      (agentState.manualRegime && Date.now() < agentState.manualRegimeExpiry
+        ? `当前手动覆盖: ${agentState.manualRegime} (剩 ${Math.ceil((agentState.manualRegimeExpiry - Date.now()) / 60000)} 分钟)\n`
+        : '当前无手动覆盖\n') +
+      '\nRegime 对应 range (volatile 池):\n' +
+      `• 稳定 ±${CONFIG.REGIME_RANGE_STABLE/2}%\n` +
+      `• 震荡 ±${CONFIG.REGIME_RANGE_OSCILLATION/2}%\n` +
+      `• 趋势 ±${CONFIG.REGIME_RANGE_TREND/2}%\n` +
+      `• 高波动 ±${CONFIG.REGIME_RANGE_HIGH_VOL/2}%`
+    );
+    return;
+  }
+  const regime = args[0] as '稳定' | '震荡' | '趋势' | '高波动';
+  const EXPIRY_MS = 6 * 3600_000; // 6 小时
+  agentState.manualRegime = regime;
+  agentState.manualRegimeExpiry = Date.now() + EXPIRY_MS;
+  const rangePct = ({
+    '稳定': CONFIG.REGIME_RANGE_STABLE,
+    '震荡': CONFIG.REGIME_RANGE_OSCILLATION,
+    '趋势': CONFIG.REGIME_RANGE_TREND,
+    '高波动': CONFIG.REGIME_RANGE_HIGH_VOL,
+  })[regime];
+  await ctx.reply(
+    `✅ 手动覆盖已生效: <b>${regime}</b>\n` +
+    `→ volatile 池新开仓将用 ±${rangePct/2}%\n` +
+    `→ 6 小时后自动失效,LLM 接管\n\n` +
+    `(LLM 当前判: ${agentState.lastMarketRegime})\n` +
+    `已有持仓不受影响,只影响下次新开仓`,
+    { parse_mode: 'HTML' }
+  );
+});
+
+bot.command('clearregime', async (ctx) => {
+  if (!agentState.manualRegime) {
+    await ctx.reply(`当前无手动覆盖\n现在用 LLM 判: ${agentState.lastMarketRegime}`);
+    return;
+  }
+  const wasManual = agentState.manualRegime;
+  agentState.manualRegime = null;
+  agentState.manualRegimeExpiry = 0;
+  await ctx.reply(
+    `✅ 已清除手动覆盖 (原: ${wasManual})\n` +
+    `→ LLM agent 重新接管: ${agentState.lastMarketRegime}`
+  );
+});
+
 // ============================================================
 // 15. 健康检查
 // ============================================================
@@ -3333,6 +3401,10 @@ const agentState = {
   lastHealthResult: '尚未运行',
   lastMarketRegime: '未知' as '稳定' | '震荡' | '趋势' | '高波动' | '未知',
   lastMarketReason: '尚未运行',
+  // V0.11.0h: 手动覆盖 (优先级高于 LLM)
+  manualRegime: null as null | '稳定' | '震荡' | '趋势' | '高波动',
+  manualRegimeExpiry: 0,                // Date.now() ms, 0=未设置
+  lastRegimeClampInfo: '',              // V0.11.0h: 规则兜底信息 (空=未触发)
 };
 
 /**
@@ -3520,8 +3592,51 @@ async function runHealthCheckAgent(): Promise<void> {
 }
 
 /**
+ * V0.11.0h: 规则兜底
+ * 只校正 LLM 明显违反阈值的判断,在合理区间内尊重 LLM 的判断
+ * 阈值参考 prompt:
+ *   1. 高波动: 区间 > 10%
+ *   2. 趋势: |单向| > 5%, 区间 ≤ 10%
+ *   3. 震荡: 区间 3-10%, |单向| ≤ 5%
+ *   4. 稳定: 区间 < 3%
+ *
+ * 兜底逻辑 (只校正明显误判):
+ *   - 区间 > 12% 但 LLM 没判高波动 → 强制高波动
+ *   - LLM 判高波动但区间 < 10% → 按真实数据降级
+ *   - LLM 判稳定但 |单向| > 5% 或区间 > 5% → 升级
+ *   - 其他情况尊重 LLM
+ */
+function clampRegimeByRules(
+  llmRegime: '稳定' | '震荡' | '趋势' | '高波动',
+  range_pct: number,
+  change_pct: number,
+): '稳定' | '震荡' | '趋势' | '高波动' {
+  const absChange = Math.abs(change_pct);
+
+  // 兜底 1: 真高波动 LLM 漏判 (区间 > 12% 留 2% buffer)
+  if (range_pct > 12 && llmRegime !== '高波动') return '高波动';
+
+  // 兜底 2: LLM 判高波动但区间不到 10% (这就是 Kings 当前遇到的情况)
+  if (llmRegime === '高波动' && range_pct < 10) {
+    if (absChange > 5) return '趋势';
+    if (range_pct < 3) return '稳定';
+    return '震荡';
+  }
+
+  // 兜底 3: LLM 判稳定但其实波动不小
+  if (llmRegime === '稳定' && (range_pct > 5 || absChange > 5)) {
+    if (absChange > 5) return '趋势';
+    return '震荡';
+  }
+
+  // 其他情况尊重 LLM (在合理灰色地带让 LLM 发挥)
+  return llmRegime;
+}
+
+/**
  * Agent #2: 市场状态 Agent (LLM)
  * 拉 24h SOL ohlcv → Claude Haiku 分类: 稳定/震荡/趋势/高波动
+ * V0.11.0h: 加规则兜底, LLM 边界判断自动纠正
  * 只通知状态切换,避免刷屏
  */
 async function runMarketRegimeAgent(): Promise<void> {
@@ -3539,6 +3654,7 @@ async function runMarketRegimeAgent(): Promise<void> {
 
     // 拉 24h SOL/USDC ohlcv (用 SOL/USDC 主流池)
     let ohlcvSummary = '近期数据缺失';
+    let metricsForRules: { range_pct: number; change_pct: number } | null = null;
     try {
       const url = `${CONFIG.GECKOTERMINAL_API}/networks/solana/pools/3ne4mWqdYuNiYrYZC9TrA3FcfuFdErghH97vNPbjicr1/ohlcv/hour?aggregate=1&limit=24`;
       const r = await fetch(url, { signal: AbortSignal.timeout(8000) });
@@ -3558,6 +3674,8 @@ async function runMarketRegimeAgent(): Promise<void> {
           const first = prices[prices.length - 1];
           const change = ((last - first) / first) * 100;
           const range = ((high - low) / low) * 100;
+          // V0.11.0h: 给规则兜底用
+          metricsForRules = { range_pct: range, change_pct: change };
           // V0.9.4: 自适应小数位 (Gecko 池子可能返回 USDC/SOL 反向价格如 0.0104,需要 4-6 位)
           const dp = Math.max(high, last) < 1 ? 6 : 2;
           ohlcvSummary = `24h: $${first.toFixed(dp)} → $${last.toFixed(dp)} (${change >= 0 ? '+' : ''}${change.toFixed(2)}%), 区间波动 ${range.toFixed(2)}% (high $${high.toFixed(dp)} / low $${low.toFixed(dp)})`;
@@ -3572,12 +3690,16 @@ async function runMarketRegimeAgent(): Promise<void> {
       console.error(`[market-regime] ohlcv: ${e.message}`);
     }
 
-    const prompt = `你是加密 LP 市场分析助手。基于以下 SOL 数据,把当前市场状态归类为以下 4 类之一:
+    const prompt = `你是加密 LP 市场分析助手。基于以下 SOL 24h 数据,严格按阈值归类为以下 4 类之一:
 
-- 稳定: 24h 总体波动 < 3%, 价格平稳
-- 震荡: 24h 波动 3-7%, 来回拉锯无明确方向
-- 趋势: 24h 单向 > 5%, 涨/跌一边倒
-- 高波动: 24h 区间 > 10% 或剧烈上下震荡
+判定优先级 (从上到下逐条检查,第一个匹配的就是答案):
+1. 高波动: 24h 区间(high-low)/low > 10%
+2. 趋势: 24h 单向变化 (|change|) > 5% 且区间 ≤ 10%
+3. 震荡: 24h 区间 3-10% 且单向 ≤ 5%
+4. 稳定: 24h 区间 < 3%
+
+严格按数字判断,不要"接近临界""感觉像"等主观词。
+区间和单向同时给出时,按上方优先级走,不要混合判断。
 
 数据:
 当前 SOL 价: $${solPrice.toFixed(2)}
@@ -3594,27 +3716,43 @@ ${ohlcvSummary}
       return;
     }
     const parsed = JSON.parse(jsonMatch[0]);
-    const regime = parsed.regime;
-    const reason = parsed.reason || '';
+    const llmRegime = parsed.regime;
+    let reason = parsed.reason || '';
 
-    if (!['稳定', '震荡', '趋势', '高波动'].includes(regime)) {
-      agentState.lastMarketReason = `未知 regime: ${regime}`;
+    if (!['稳定', '震荡', '趋势', '高波动'].includes(llmRegime)) {
+      agentState.lastMarketReason = `未知 regime: ${llmRegime}`;
       return;
     }
 
+    // V0.11.0h: 规则兜底 — 用真实数值校正 LLM 边界判断
+    let finalRegime: '稳定' | '震荡' | '趋势' | '高波动' = llmRegime;
+    let clampInfo = '';
+    if (metricsForRules) {
+      const { range_pct, change_pct } = metricsForRules;
+      const ruleRegime = clampRegimeByRules(llmRegime, range_pct, change_pct);
+      if (ruleRegime !== llmRegime) {
+        clampInfo = `LLM=${llmRegime} → 规则修正=${ruleRegime} (区间${range_pct.toFixed(2)}% 单向${change_pct >= 0 ? '+' : ''}${change_pct.toFixed(2)}%)`;
+        console.warn(`[market-regime] ${clampInfo}`);
+        reason = `[规则修正] ${reason}`;
+        finalRegime = ruleRegime;
+      }
+    }
+    agentState.lastRegimeClampInfo = clampInfo;
+
     const prevRegime = agentState.lastMarketRegime;
-    agentState.lastMarketRegime = regime;
+    agentState.lastMarketRegime = finalRegime;
     agentState.lastMarketReason = reason;
     agentState.lastMarketRegimeAt = Date.now();
 
     // 状态切换才通知,避免刷屏
-    if (regime !== prevRegime) {
-      const emoji = ({ '稳定': '😴', '震荡': '🌊', '趋势': '📈', '高波动': '⚡' } as any)[regime] || '❓';
+    if (finalRegime !== prevRegime) {
+      const emoji = ({ '稳定': '😴', '震荡': '🌊', '趋势': '📈', '高波动': '⚡' } as any)[finalRegime] || '❓';
       await notify(
-        `${emoji} <b>市场状态: ${escapeHtml(regime)}</b>\n` +
+        `${emoji} <b>市场状态: ${escapeHtml(finalRegime)}</b>\n` +
         `${escapeHtml(reason)}\n\n` +
         `(切换自: ${escapeHtml(prevRegime)})\n` +
-        `${escapeHtml(ohlcvSummary)}`
+        `${escapeHtml(ohlcvSummary)}` +
+        (clampInfo ? `\n\n⚠️ ${escapeHtml(clampInfo)}` : '')
       );
     }
   } catch (e: any) {
@@ -3762,6 +3900,8 @@ async function start() {
       { command: 'resume', description: '恢复' },
       { command: 'discover', description: '抓 top 池子加入候选' },
       { command: 'scan', description: '扫候选池打分' },
+      { command: 'setregime', description: '手动覆盖 regime 6h' },
+      { command: 'clearregime', description: '清除手动 regime 覆盖' },
       { command: 'close', description: '手动关仓 <position_pk>' },
       { command: 'open', description: '手动开仓 <addr> <amount_usd>' },
       { command: 'emergency', description: '紧急平所有仓' },
@@ -3775,7 +3915,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.0g (V0.11.0e + regime-aware range)\n` +
+    `Version: V0.11.0h (V0.11.0g + 规则兜底 + /setregime 手动覆盖)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
