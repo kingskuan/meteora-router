@@ -1784,6 +1784,8 @@ async function closePosition(positionPk: string, reason: string = 'manual'): Pro
     `✅ <b>关仓成功</b> (${reason})\n` +
     `tx: <code>${lastSig}</code>`
   );
+  // V0.11.0i: 关仓时清除恢复通知标记 (避免内存泄漏)
+  rebalanceRecoveredNotified.delete(positionPk);
   return lastSig;
 }
 
@@ -1840,6 +1842,10 @@ const stopLossHitCount = new Map<string, number>();
 const stopLossWarnedSet = new Set<string>(); // 软警告已发送(防刷屏)
 // V0.11: depeg 警报已发送的 position 集合(防刷屏)
 const depegAlertedSet = new Set<string>();
+
+// V0.11.0i: rebalance 失败后, 如果价格自然回 range, 发"自然恢复"通知 — 只发一次防刷屏
+// key: positionPk. 关仓时从 Set 清除避免内存泄漏
+const rebalanceRecoveredNotified = new Set<string>();
 
 async function tickPositions() {
   const positions = await getUserPositions();
@@ -1979,6 +1985,27 @@ async function tickPositions() {
             await rebalancePosition(p, openValueUsd);
             continue;
           }
+        }
+      } else {
+        // V0.11.0i: 仓位 in range, 检查是否需要发"自然恢复"通知
+        // 场景: rebalance 失败后, 5min cooldown 期间价格自然回 range → 之前 bot 沉默, 用户以为宕机
+        // 触发条件: 最近 30 分钟内有过 rebalance 失败 + 此前没发过恢复通知 + 失败计数 > 0
+        const lastRb = lastRebalanceAt.get(p.lbPair);
+        const failCount = rebalanceFailCount.get(p.lbPair) ?? 0;
+        if (
+          lastRb &&
+          (Date.now() - lastRb) < 30 * 60_000 &&
+          failCount > 0 &&
+          !rebalanceRecoveredNotified.has(p.positionPk)
+        ) {
+          await notify(
+            `📈 <b>${p.pairName} 价格已回 range</b>\n` +
+            `Rebalance 自动取消,仓位继续赚 fee\n` +
+            `active bin ${p.activeBinId} (range ${p.minBinId}~${p.maxBinId})\n` +
+            `(之前失败 ${failCount} 次, 已重置)`
+          );
+          rebalanceRecoveredNotified.add(p.positionPk);
+          rebalanceFailCount.delete(p.lbPair); // 失败计数清零, 下次出 range 重新计
         }
       }
 
@@ -2194,6 +2221,23 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
           ? `智能恢复 /resume 后将立刻扫池开新仓`
           : `下个 tick (~2 分钟) 内将自动尝试开新仓`)
       );
+    } else {
+      // V0.11.0i 核心 bug 修复: close 阶段就失败 (positionClosed=false)
+      // closePosition 在开头把 status 改成 'closing', 但 sendTx 失败时没回滚
+      // 不回滚导致:
+      //   1. tickAutoOpen 查 status='open' 看不到这个仓位, 会开同 pair 不同 bin_step 新仓
+      //   2. /positions /portfolio 等查询展示不全
+      //   3. 暴露计算不算这个仓位, exposure cap 失效
+      try {
+        await db.query(
+          `UPDATE positions SET status='open' WHERE position_pk=$1 AND status='closing'`,
+          [p.positionPk]
+        );
+        console.log(`[rebalance] DB rollback: ${p.positionPk.slice(0,8)} closing → open (close 阶段失败, 钱还在仓位里)`);
+      } catch (rollbackErr: any) {
+        console.error(`[rebalance] DB rollback failed: ${rollbackErr.message}`);
+        await notify(`⚠️ DB rollback 失败: ${rollbackErr.message}\n手动检查 status: /positions`);
+      }
     }
   } finally {
     // V2.3: 无论成功失败都释放标志位
@@ -2222,7 +2266,9 @@ async function tickAutoOpen(verbose: boolean = false) {
   }
 
   // V0.11: 按类型分别计数 (volatile/stable),并保留总 cap 兜底
-  const openPositionsR = await db.query<{ lb_pair: string }>(`SELECT lb_pair FROM positions WHERE status='open'`);
+  // V0.11.0i: 把 'closing' 状态也算"持仓中" — 防御性, 如果 closePosition 失败 + DB rollback 也失败
+  //          的极端情况, 这里仍能正确识别避免开重复仓
+  const openPositionsR = await db.query<{ lb_pair: string }>(`SELECT lb_pair FROM positions WHERE status IN ('open','closing')`);
   const openCount = openPositionsR.rows.length;
   if (openCount >= CONFIG.MAX_OPEN_POSITIONS) return;
 
@@ -2254,8 +2300,9 @@ async function tickAutoOpen(verbose: boolean = false) {
   }
 
   // 已持仓的 token pair (规范化排序,避免 X/Y 顺序差异)
+  // V0.11.0i: 'closing' 也算持仓中 (防御性)
   const heldPairsR = await db.query<{ lb_pair: string }>(
-    `SELECT lb_pair FROM positions WHERE status = 'open'`
+    `SELECT lb_pair FROM positions WHERE status IN ('open','closing')`
   );
   const heldPairKeys = new Set<string>();
   for (const row of heldPairsR.rows) {
@@ -2279,8 +2326,8 @@ async function tickAutoOpen(verbose: boolean = false) {
       skipReasons.push(`${candidate.info.pairName} bin_step ${candidate.info.binStep}: 冷却期`);
       continue;
     }
-    // 已在该池开仓 → 跳过
-    const dup = await db.query(`SELECT 1 FROM positions WHERE lb_pair=$1 AND status='open' LIMIT 1`, [candidate.info.address]);
+    // 已在该池开仓 → 跳过 (V0.11.0i: 'closing' 也算)
+    const dup = await db.query(`SELECT 1 FROM positions WHERE lb_pair=$1 AND status IN ('open','closing') LIMIT 1`, [candidate.info.address]);
     if (dup.rows.length > 0) {
       skipReasons.push(`${candidate.info.pairName} bin_step ${candidate.info.binStep}: 已持仓`);
       continue;
@@ -3915,7 +3962,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.0h (V0.11.0g + 规则兜底 + /setregime 手动覆盖)\n` +
+    `Version: V0.11.0i (V0.11.0h + close 回滚 + 价格回 range 通知)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
