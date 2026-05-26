@@ -295,6 +295,23 @@ async function retryWithFallback<T>(
   throw lastErr;
 }
 
+/**
+ * V0.11.1: DLMM.create with RPC fallback
+ * primary 限流 (429 / -32413) 时自动切 connectionBackup (第二个 Helius key)
+ * 覆盖所有 DLMM 操作: getPositionsByUserAndLbPair / getActiveBin / removeLiquidity 等
+ */
+async function createDlmmWithFallback(address: PublicKey): Promise<Awaited<ReturnType<typeof DLMM.create>>> {
+  try {
+    return await DLMM.create(connection, address);
+  } catch (e: any) {
+    if (isRateLimitErr(e) && connectionBackup) {
+      console.warn(`[dlmm-fallback] primary rate-limited → backup: ${address.toBase58().slice(0, 8)}`);
+      return await DLMM.create(connectionBackup, address);
+    }
+    throw e;
+  }
+}
+
 function tokenSymbol(mint: string): string {
   return KNOWN_TOKENS[mint]?.symbol || `${mint.slice(0, 4)}...`;
 }
@@ -506,7 +523,7 @@ async function getSolPriceOnchain(): Promise<number> {
     return solPriceCache.price;
   }
   try {
-    const dlmm = await DLMM.create(connection, new PublicKey(SOL_PRICE_REFERENCE_POOL));
+    const dlmm = await createDlmmWithFallback(new PublicKey(SOL_PRICE_REFERENCE_POOL));
     const activeBin = await dlmm.getActiveBin();
     const price = parseFloat(dlmm.fromPricePerLamport(Number(activeBin.price)));
     if (price > 0 && price < 10000) { // sanity check
@@ -912,7 +929,7 @@ async function _getOnchainFeeStatsImpl(
 }
 
 async function getPoolInfo(lbPair: string): Promise<PoolInfo> {
-  const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
+  const dlmmPool = await createDlmmWithFallback(new PublicKey(lbPair));
   const activeBin = await dlmmPool.getActiveBin();
 
   const tokenXMint = dlmmPool.tokenX.publicKey.toBase58();
@@ -1034,7 +1051,7 @@ async function getUserPositions(lbPair?: string): Promise<PositionInfo[]> {
     return results;
   }
 
-  const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
+  const dlmmPool = await createDlmmWithFallback(new PublicKey(lbPair));
   const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
   const activeBin = await dlmmPool.getActiveBin();
   const binStep = dlmmPool.lbPair.binStep;
@@ -1506,7 +1523,7 @@ async function _openPositionImpl(lbPair: string, amountUsd: number): Promise<{ p
   if (state.paused) throw new Error('bot 已 paused');
   if (amountUsd > CONFIG.MAX_POSITION_USD) throw new Error(`金额 $${amountUsd} > 上限 $${CONFIG.MAX_POSITION_USD}`);
 
-  const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
+  const dlmmPool = await createDlmmWithFallback(new PublicKey(lbPair));
   const activeBin = await dlmmPool.getActiveBin();
   const tokenXMint = dlmmPool.tokenX.publicKey.toBase58();
   const tokenYMint = dlmmPool.tokenY.publicKey.toBase58();
@@ -1710,7 +1727,7 @@ async function closePosition(positionPk: string, reason: string = 'manual'): Pro
   await db.query(`UPDATE positions SET status = 'closing' WHERE id = $1`, [dbId]);
   await notify(`🔻 <b>关仓中...</b> ${reason}\nposition: <code>${positionPk}</code>`);
 
-  const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
+  const dlmmPool = await createDlmmWithFallback(new PublicKey(lbPair));
   const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
   const pos = userPositions.find(p => p.publicKey.toBase58() === positionPk);
   if (!pos) {
@@ -1801,7 +1818,7 @@ async function claimFees(positionPk: string): Promise<string> {
   const dbId = r.rows[0].id;
   const lbPair = r.rows[0].lb_pair;
 
-  const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
+  const dlmmPool = await createDlmmWithFallback(new PublicKey(lbPair));
   const { userPositions } = await dlmmPool.getPositionsByUserAndLbPair(wallet.publicKey);
   const pos = userPositions.find(p => p.publicKey.toBase58() === positionPk);
   if (!pos) throw new Error('position not found onchain');
@@ -2074,7 +2091,7 @@ async function rebalancePosition(p: PositionInfo, originalValueUsd: number) {
 
   try {
     // 池子 token 信息(用于钱包快照)
-    const dlmmPool = await DLMM.create(connection, new PublicKey(lbPair));
+    const dlmmPool = await createDlmmWithFallback(new PublicKey(lbPair));
     const xMint = dlmmPool.tokenX.publicKey.toBase58();
     const yMint = dlmmPool.tokenY.publicKey.toBase58();
     const xDec =
@@ -3962,7 +3979,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.0i (V0.11.0h + close 回滚 + 价格回 range 通知)\n` +
+    `Version: V0.11.1 (dual-Helius DLMM fallback)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
