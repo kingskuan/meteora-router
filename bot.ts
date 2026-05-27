@@ -181,7 +181,7 @@ interface RuntimeState {
 
 const state: RuntimeState = {
   paused: false,
-  autoTrading: false,
+  autoTrading: true,   // V0.11.2: 默认 auto ON，redeploy 不用手打
   firstOpenConfirmed: false,
   rebalancing: false,
   opening: false,             // V0.11.0b
@@ -3202,6 +3202,51 @@ bot.command('close', async (ctx) => {
   }
 });
 
+// V0.11.2: 强制把 DB 里的仓位标记成 closed，不读链上
+// 用途：手动在 Meteora UI 关仓后 bot DB 还显示 open 时使用
+// 用法：/dbclose <id>  (id 是数字，例如 /dbclose 35)
+bot.command('dbclose', async (ctx) => {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  const id = parseInt(args[0]);
+  if (!id || isNaN(id)) {
+    await ctx.reply('用法: /dbclose <id>\n例如: /dbclose 35\n\n查 id 用 /dblist');
+    return;
+  }
+  try {
+    const res = await db.query(
+      `UPDATE positions SET status='closed', closed_at=NOW() WHERE id=$1 AND status IN ('open','closing') RETURNING id, lb_pair, status`,
+      [id]
+    );
+    if (res.rows.length === 0) {
+      await ctx.reply(`⚠️ id=${id} 不存在或已是 closed`);
+    } else {
+      const r = res.rows[0];
+      await ctx.reply(`✅ DB 已强制关仓\nid: ${r.id}\nlb_pair: ${r.lb_pair}`);
+    }
+  } catch (e: any) {
+    await ctx.reply(`❌ ${e.message}`);
+  }
+});
+
+// V0.11.2: 列出所有 open/closing 状态的 DB 仓位（查 id 用）
+bot.command('dblist', async (ctx) => {
+  try {
+    const res = await db.query(
+      `SELECT id, lb_pair, status, created_at FROM positions WHERE status IN ('open','closing') ORDER BY id DESC LIMIT 10`
+    );
+    if (res.rows.length === 0) {
+      await ctx.reply('DB 里没有 open/closing 仓位');
+      return;
+    }
+    const lines = res.rows.map((r: any) =>
+      `id=${r.id} | ${r.lb_pair.slice(0,8)}... | ${r.status}`
+    ).join('\n');
+    await ctx.reply(`📋 DB open 仓位:\n${lines}\n\n用 /dbclose <id> 强制关闭`);
+  } catch (e: any) {
+    await ctx.reply(`❌ ${e.message}`);
+  }
+});
+
 bot.command('emergency', async (ctx) => {
   await ctx.reply('🚨 紧急平仓所有头寸...');
   state.paused = true;
@@ -3979,7 +4024,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.1 (dual-Helius DLMM fallback)\n` +
+    `Version: V0.11.2 (auto ON by default + /dbclose /dblist)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
