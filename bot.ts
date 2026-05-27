@@ -3264,12 +3264,22 @@ bot.command('dbinsert', async (ctx) => {
   const usd = parseFloat(usdStr);
   if (isNaN(usd)) { await ctx.reply('❌ usd_amount 必须是数字'); return; }
   try {
-    // 检查是否已存在
+    // 检查是否已存在（包含 closed 状态）
     const exist = await db.query(
-      `SELECT id FROM positions WHERE position_pk = $1`, [positionPk]
+      `SELECT id, status FROM positions WHERE position_pk = $1`, [positionPk]
     );
     if (exist.rows.length > 0) {
-      await ctx.reply(`⚠️ 已存在 id=${exist.rows[0].id}，无需重复插入`);
+      const row = exist.rows[0];
+      if (row.status === 'open' || row.status === 'closing') {
+        await ctx.reply(`⚠️ 已存在且 status=${row.status}，id=${row.id}，无需操作`);
+        return;
+      }
+      // closed 记录 → 重新激活为 open
+      await db.query(
+        `UPDATE positions SET status='open', lb_pair=$2, pair_name=$3, open_value_usd=$4, closed_at=NULL, meta='{"source":"dbinsert_reactivate"}' WHERE id=$1`,
+        [row.id, lbPair, pairName, usd]
+      );
+      await ctx.reply(`✅ 已重新激活 DB 记录\nid: ${row.id}\nposition_pk: ${positionPk.slice(0,16)}...\npair: ${pairName} $${usd}`);
       return;
     }
     const res = await db.query(
@@ -4060,7 +4070,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.3 (fix dblist + add dbinsert)\n` +
+    `Version: V0.11.4 (fix dbinsert reactivate closed positions)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
