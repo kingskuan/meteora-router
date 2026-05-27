@@ -3228,20 +3228,56 @@ bot.command('dbclose', async (ctx) => {
   }
 });
 
-// V0.11.2: 列出所有 open/closing 状态的 DB 仓位（查 id 用）
+// V0.11.3: 列出所有 open/closing 状态的 DB 仓位（查 id 用）
 bot.command('dblist', async (ctx) => {
   try {
     const res = await db.query(
-      `SELECT id, lb_pair, status, created_at FROM positions WHERE status IN ('open','closing') ORDER BY id DESC LIMIT 10`
+      `SELECT id, lb_pair, pair_name, status, open_value_usd, opened_at FROM positions WHERE status IN ('open','closing') ORDER BY id DESC LIMIT 10`
     );
     if (res.rows.length === 0) {
       await ctx.reply('DB 里没有 open/closing 仓位');
       return;
     }
     const lines = res.rows.map((r: any) =>
-      `id=${r.id} | ${r.lb_pair.slice(0,8)}... | ${r.status}`
+      `id=${r.id} | ${r.pair_name || r.lb_pair.slice(0,8)} | $${r.open_value_usd?.toFixed(0) || '?'} | ${r.status}`
     ).join('\n');
     await ctx.reply(`📋 DB open 仓位:\n${lines}\n\n用 /dbclose <id> 强制关闭`);
+  } catch (e: any) {
+    await ctx.reply(`❌ ${e.message}`);
+  }
+});
+
+// V0.11.3: 手动把链上已存在的仓位注册进 DB
+// 用途: bot confirm 失败但链上实际已开仓时，手动同步 DB
+// 用法: /dbinsert <position_pk> <lb_pair> <pair_name> <usd_amount>
+// 例如: /dbinsert GYZGPJUAUJCTq... 5rCf1DM8... SOL/USDC 359.51
+bot.command('dbinsert', async (ctx) => {
+  const args = ctx.message.text.split(/\s+/).slice(1);
+  if (args.length < 4) {
+    await ctx.reply(
+      '用法: /dbinsert <position_pk> <lb_pair> <pair_name> <usd_amount>\n' +
+      '例如: /dbinsert GYZGPJUAUJCTqQn9... 5rCf1DM8abc... SOL/USDC 359.51'
+    );
+    return;
+  }
+  const [positionPk, lbPair, pairName, usdStr] = args;
+  const usd = parseFloat(usdStr);
+  if (isNaN(usd)) { await ctx.reply('❌ usd_amount 必须是数字'); return; }
+  try {
+    // 检查是否已存在
+    const exist = await db.query(
+      `SELECT id FROM positions WHERE position_pk = $1`, [positionPk]
+    );
+    if (exist.rows.length > 0) {
+      await ctx.reply(`⚠️ 已存在 id=${exist.rows[0].id}，无需重复插入`);
+      return;
+    }
+    const res = await db.query(
+      `INSERT INTO positions(position_pk, lb_pair, pair_name, strategy, min_bin_id, max_bin_id, open_price, open_token_x_amount, open_token_y_amount, open_value_usd, status, meta)
+       VALUES($1,$2,$3,'manual',0,0,0,0,0,$4,'open','{"source":"dbinsert"}') RETURNING id`,
+      [positionPk, lbPair, pairName, usd]
+    );
+    await ctx.reply(`✅ 已插入 DB\nid: ${res.rows[0].id}\nposition_pk: ${positionPk.slice(0,16)}...\npair: ${pairName} $${usd}`);
   } catch (e: any) {
     await ctx.reply(`❌ ${e.message}`);
   }
@@ -4024,7 +4060,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.2 (auto ON by default + /dbclose /dblist)\n` +
+    `Version: V0.11.3 (fix dblist + add dbinsert)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
