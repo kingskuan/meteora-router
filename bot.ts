@@ -144,14 +144,22 @@ const KNOWN_TOKENS: Record<string, { symbol: string; decimals: number }> = {
 };
 
 // 白名单 token mint(只允许这些 token 进入候选池)
+const JLP_MINT  = 'JLP...'; // Jupiter LP token - 见注释
+// JLP/USDC Meteora DLMM 池地址需要从 meteora.ag 查询后填入 CANDIDATE_POOLS_DEFAULT
+// 暂时先用 SOL/USDC + USDC/USDT 双池覆盖三市场
+
 const WHITELIST_MINTS = new Set([SOL_MINT, USDC_MINT, USDT_MINT]);
 
 // 候选池子(V0.1 硬编码主流池;/discover 命令会自动扩充)
 // 这些是 SOL/USDC、SOL/USDT、USDC/USDT 不同 bin_step 的真实池子
+// V0.11.6: 三市场候选池
+// 震荡市 → SOL/USDC bin_step 4 (窄 range, 高 APR)
+// 牛市   → SOL/USDC bin_step 10/20 (宽 range, 追价)
+// 熊市   → USDC/USDT (零 IL, 纯手续费, 跑赢 SOL 下跌)
 const CANDIDATE_POOLS_DEFAULT: string[] = [
-  'BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y', // SOL/USDC bin_step 10
-  '5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6', // SOL/USDC active pool (Pool Age 2y+)
-  'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq', // USDC/USDT (SDK 文档示例)
+  'BGm1tav58oGcsQJehL9WXBFXF7D27vZsKefj4xJKD5Y', // SOL/USDC bin_step 10 (牛市/震荡)
+  '5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6', // SOL/USDC bin_step 4  (震荡/最优)
+  'ARwi1S4DaiTG5DX7S4M4ZsrXqpMD1MrTmbu9ue2tpmEq', // USDC/USDT (熊市/趋势安全仓)
 ];
 
 // ============================================================
@@ -1186,6 +1194,41 @@ function scorePool(p: PoolInfo): { score: number; reasons: string[] } {
     score -= penalty;
     reasons.push(`TVL 偏小 = -${penalty.toFixed(1)}`);
   }
+
+  // V0.11.6: 三市场 regime-aware 评分
+  // 核心逻辑: 不同市场用不同池子赚钱
+  //   震荡 → SOL/USDC 窄 range 最优, 无调整
+  //   牛市 → SOL/USDC 还能赚, stable 降权 (牛市 USDC/USDT 成交量低)
+  //   熊市 → stable 对大幅加分 (零 IL + 人恐慌换稳定币 → 成交量反而高)
+  //   趋势 → 同熊市逻辑, stable 优先
+  //   高波动 → stable 对加分, 避免窄 range volatile 频繁 out-of-range 亏手续费
+  const regime = agentState.manualRegime ?? agentState.lastMarketRegime;
+  if (regime === '趋势' || regime === '熊市') {
+    if (isStableStable) {
+      score *= 2.5;
+      reasons.push(`熊市/趋势 stable 对 ×2.5 → 零IL保本`);
+    } else {
+      score *= 0.4;
+      reasons.push(`熊市/趋势 volatile 对 ×0.4 → SOL下行风险`);
+    }
+  } else if (regime === '高波动') {
+    if (isStableStable) {
+      score *= 1.8;
+      reasons.push(`高波动 stable 对 ×1.8 → 避免频繁 rebalance`);
+    } else {
+      score *= 0.6;
+      reasons.push(`高波动 volatile 对 ×0.6`);
+    }
+  } else if (regime === '牛市') {
+    if (isStableStable) {
+      score *= 0.7;
+      reasons.push(`牛市 stable 对 ×0.7 → 错过 SOL 上涨`);
+    } else {
+      score *= 1.3;
+      reasons.push(`牛市 volatile 对 ×1.3 → 高成交量`);
+    }
+  }
+  // 稳定/震荡/未知 → 不调整, 原始评分决定
 
   return { score, reasons };
 }
@@ -2300,6 +2343,13 @@ async function tickAutoOpen(verbose: boolean = false) {
   if (openVolatile >= CONFIG.MAX_VOLATILE_POSITIONS && openStable >= CONFIG.MAX_STABLE_POSITIONS) {
     console.log(`[tickAutoOpen] both types full: volatile=${openVolatile}/${CONFIG.MAX_VOLATILE_POSITIONS}, stable=${openStable}/${CONFIG.MAX_STABLE_POSITIONS}`);
     return;
+  }
+
+  // V0.11.6: 趋势/高波动市场 → 不完全暂停，由 regime-aware 评分自动选 stable 对
+  // 只有在没有任何 stable 对候选时才暂停（避免开 volatile 对亏损）
+  const currentRegime = agentState.manualRegime ?? agentState.lastMarketRegime;
+  if (currentRegime === '趋势' || currentRegime === '高波动') {
+    console.log(`[tickAutoOpen] regime=${currentRegime}，优先 stable 对，volatile 对降权`);
   }
 
   // 4h 内已扫过就不重扫
@@ -4070,7 +4120,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.4 (fix dbinsert reactivate closed positions)\n` +
+    `Version: V0.11.6 (三市场动态选池: 震荡=SOL/USDC, 熊市=USDC/USDT, 牛市=volatile优先)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
