@@ -1196,20 +1196,19 @@ function scorePool(p: PoolInfo): { score: number; reasons: string[] } {
   }
 
   // V0.11.6: 三市场 regime-aware 评分
-  // 核心逻辑: 不同市场用不同池子赚钱
-  //   震荡 → SOL/USDC 窄 range 最优, 无调整
-  //   牛市 → SOL/USDC 还能赚, stable 降权 (牛市 USDC/USDT 成交量低)
-  //   熊市 → stable 对大幅加分 (零 IL + 人恐慌换稳定币 → 成交量反而高)
-  //   趋势 → 同熊市逻辑, stable 优先
-  //   高波动 → stable 对加分, 避免窄 range volatile 频繁 out-of-range 亏手续费
+  // 现有 regime 类型: 稳定 | 震荡 | 趋势 | 高波动 | 未知
+  //   趋势   = 单边行情 (可能牛也可能熊) → stable 对避险
+  //   高波动  = 极端波动 → stable 对保守
+  //   稳定   = SOL/USDC 窄 range 最优
+  //   震荡   = SOL/USDC 窄 range 最优
   const regime = agentState.manualRegime ?? agentState.lastMarketRegime;
-  if (regime === '趋势' || regime === '熊市') {
+  if (regime === '趋势') {
     if (isStableStable) {
       score *= 2.5;
-      reasons.push(`熊市/趋势 stable 对 ×2.5 → 零IL保本`);
+      reasons.push(`趋势市场 stable 对 ×2.5 → 零IL避险`);
     } else {
       score *= 0.4;
-      reasons.push(`熊市/趋势 volatile 对 ×0.4 → SOL下行风险`);
+      reasons.push(`趋势市场 volatile 对 ×0.4 → 单边风险`);
     }
   } else if (regime === '高波动') {
     if (isStableStable) {
@@ -1219,16 +1218,8 @@ function scorePool(p: PoolInfo): { score: number; reasons: string[] } {
       score *= 0.6;
       reasons.push(`高波动 volatile 对 ×0.6`);
     }
-  } else if (regime === '牛市') {
-    if (isStableStable) {
-      score *= 0.7;
-      reasons.push(`牛市 stable 对 ×0.7 → 错过 SOL 上涨`);
-    } else {
-      score *= 1.3;
-      reasons.push(`牛市 volatile 对 ×1.3 → 高成交量`);
-    }
   }
-  // 稳定/震荡/未知 → 不调整, 原始评分决定
+  // 稳定 / 震荡 / 未知 → 不调整，原始评分自然让 SOL/USDC 胜出
 
   return { score, reasons };
 }
