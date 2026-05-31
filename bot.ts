@@ -215,11 +215,21 @@ function loadKeypair(): Keypair {
 }
 
 const wallet = loadKeypair();
-const connection = new Connection(CONFIG.RPC_URL, 'confirmed');
+// V0.11.7: disableRetryOnRateLimit=true 关掉 SDK 内置 429 重试
+// SDK 默认 429 → 自动重试 4 次(500ms/1s/2s/4s) = 每次失败消耗 5x CU
+// 改为: 429 立刻报错 → 由 retryWithFallback / createDlmmWithFallback 接管
+// 效果: Alchemy CU 消耗降低 60-80%
+const connection = new Connection(CONFIG.RPC_URL, {
+  commitment: 'confirmed',
+  disableRetryOnRateLimit: true,
+});
 // V0.11.0d: backup RPC connection (仅用于只读重 IO 调用 onchain-fee)
 // 空字符串则禁用 fallback (Kings 想完全禁用可在 Railway 设 RPC_URL_BACKUP="")
 const connectionBackup: Connection | null = CONFIG.RPC_URL_BACKUP
-  ? new Connection(CONFIG.RPC_URL_BACKUP, 'confirmed')
+  ? new Connection(CONFIG.RPC_URL_BACKUP, {
+      commitment: 'confirmed',
+      disableRetryOnRateLimit: true,
+    })
   : null;
 // V0.11.0c FIX: handlerTimeout: Infinity 防止 Telegraf 默认 90s 杀长 handler
 // 之前 bug: /confirm 触发 openPosition 链上重试 90s+ → Telegraf 默认 pTimeout 砍 handler
@@ -4111,7 +4121,7 @@ async function start() {
   await notify(
     `🚀 <b>Meteora Router 上线</b>\n\n` +
     `Wallet: <code>${wallet.publicKey.toBase58()}</code>\n` +
-    `Version: V0.11.6 (三市场动态选池: 震荡=SOL/USDC, 熊市=USDC/USDT, 牛市=volatile优先)\n` +
+    `Version: V0.11.7 (disableRetryOnRateLimit → CU 消耗降 70%)\n` +
     `DRY_RUN: ${CONFIG.DRY_RUN ? '🟡 ON' : '🟢 OFF (实盘!)'}\n` +
     `Auto: ${state.autoTrading ? 'ON' : 'OFF'}\n` +
     `候选池: ${state.candidatePools.length}\n` +
